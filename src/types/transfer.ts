@@ -21,6 +21,8 @@ export type TransferStatus =
   | 'cancelled'
   | 'error';
 
+export type EncryptionMode = 'turbo-dtls' | 'dual-crypto';
+
 export interface TransferTask {
   id: string;
   fileName: string;
@@ -40,6 +42,7 @@ export interface TransferTask {
   completedAt?: number;
   downloadUrl?: string; // in-memory ObjectURL (revoked on purge/dismiss)
   isEncrypted: boolean;
+  encryptionMode?: EncryptionMode;
   fingerprint?: string;
   checksum?: string;
   // File object reference when sending
@@ -52,6 +55,7 @@ export interface TransferTask {
 
 export interface RoomConfig {
   roomId: string;
+  encryptionMode: EncryptionMode;
   e2eEncryptionEnabled: boolean;
   soundEnabled: boolean;
   notificationsEnabled: boolean;

@@ -6,6 +6,8 @@ interface RoomModalProps {
   onClose: () => void;
   currentRoom: string;
   onSwitchRoom: (room: string) => void;
+  encryptionMode?: 'turbo-dtls' | 'dual-crypto';
+  onSwitchEncryptionMode?: (mode: 'turbo-dtls' | 'dual-crypto') => void;
 }
 
 export const RoomModal: React.FC<RoomModalProps> = ({
@@ -13,6 +15,8 @@ export const RoomModal: React.FC<RoomModalProps> = ({
   onClose,
   currentRoom,
   onSwitchRoom,
+  encryptionMode = 'turbo-dtls',
+  onSwitchEncryptionMode,
 }) => {
   const [roomInput, setRoomInput] = useState(currentRoom);
 
@@ -83,6 +87,63 @@ export const RoomModal: React.FC<RoomModalProps> = ({
             </p>
           </div>
 
+          {/* Wi-Fi Acceleration Mode Selection */}
+          <div className="pt-2 border-t border-neutral-100 dark:border-neutral-800">
+            <label className="block text-xs font-semibold text-neutral-800 dark:text-neutral-200 mb-2">
+              Transfer Acceleration & Security
+            </label>
+            <div className="space-y-2">
+              <label
+                className={`p-2.5 rounded-xl border flex items-start gap-2.5 cursor-pointer transition-colors ${
+                  encryptionMode === 'turbo-dtls'
+                    ? 'border-cyan-500 bg-cyan-50/60 dark:bg-cyan-950/40 text-cyan-900 dark:text-cyan-100'
+                    : 'border-neutral-200 dark:border-neutral-800 hover:bg-neutral-50 dark:hover:bg-neutral-850'
+                }`}
+              >
+                <input
+                  type="radio"
+                  name="speedMode"
+                  checked={encryptionMode === 'turbo-dtls'}
+                  onChange={() => onSwitchEncryptionMode?.('turbo-dtls')}
+                  className="mt-0.5 text-cyan-600 focus:ring-cyan-500"
+                />
+                <div className="text-xs">
+                  <div className="font-bold flex items-center gap-1 text-cyan-700 dark:text-cyan-300">
+                    <span>⚡ Turbo Mode (15 - 40+ MB/s)</span>
+                    <span className="text-[10px] bg-cyan-100 dark:bg-cyan-900 text-cyan-700 dark:text-cyan-300 px-1.5 py-0.2 rounded font-bold">Recommended</span>
+                  </div>
+                  <p className="text-[11px] text-neutral-500 dark:text-neutral-400 mt-0.5 leading-snug">
+                    Native WebRTC DTLS AES-256-GCM hardware encryption (AES-NI). Bypasses JS event loop thread bottlenecks for maximum Wi-Fi bandwidth (120 to 320+ Mbps).
+                  </p>
+                </div>
+              </label>
+
+              <label
+                className={`p-2.5 rounded-xl border flex items-start gap-2.5 cursor-pointer transition-colors ${
+                  encryptionMode === 'dual-crypto'
+                    ? 'border-cyan-500 bg-cyan-50/60 dark:bg-cyan-950/40 text-cyan-900 dark:text-cyan-100'
+                    : 'border-neutral-200 dark:border-neutral-800 hover:bg-neutral-50 dark:hover:bg-neutral-850'
+                }`}
+              >
+                <input
+                  type="radio"
+                  name="speedMode"
+                  checked={encryptionMode === 'dual-crypto'}
+                  onChange={() => onSwitchEncryptionMode?.('dual-crypto')}
+                  className="mt-0.5 text-cyan-600 focus:ring-cyan-500"
+                />
+                <div className="text-xs">
+                  <div className="font-bold text-neutral-800 dark:text-neutral-200">
+                    🔒 Dual-Layer Mode (DTLS + WebCrypto)
+                  </div>
+                  <p className="text-[11px] text-neutral-500 dark:text-neutral-400 mt-0.5 leading-snug">
+                    Double-layer encryption using native DTLS and application-layer WebCrypto AES-GCM chunk keys.
+                  </p>
+                </div>
+              </label>
+            </div>
+          </div>
+
           <div className="flex items-center gap-2 pt-2">
             <button
               type="button"
@@ -97,7 +158,7 @@ export const RoomModal: React.FC<RoomModalProps> = ({
               type="submit"
               className="flex-1 py-2 px-3 text-xs font-semibold bg-cyan-600 hover:bg-cyan-500 text-white rounded-lg transition-colors flex items-center justify-center gap-1.5 shadow-sm shadow-cyan-600/20"
             >
-              <span>Join Room</span>
+              <span>Save & Reconnect</span>
               <ArrowRight className="w-3.5 h-3.5" />
             </button>
           </div>

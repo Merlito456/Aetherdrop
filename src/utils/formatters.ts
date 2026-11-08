@@ -13,6 +13,12 @@ export function formatBytes(bytes: number, decimals: number = 1): string {
 }
 
 export function formatSpeed(bytesPerSec: number): string {
+  if (bytesPerSec <= 0) return '0 KB/s (0 Mbps)';
+  const mbps = ((bytesPerSec * 8) / (1000 * 1000)).toFixed(1);
+  return `${formatBytes(bytesPerSec, 1)}/s (${mbps} Mbps)`;
+}
+
+export function formatSpeedCompact(bytesPerSec: number): string {
   if (bytesPerSec <= 0) return '0 KB/s';
   return `${formatBytes(bytesPerSec, 1)}/s`;
 }

@@ -27,6 +27,8 @@ import { formatBytes, formatSpeed, formatETA, getFileCategory } from '../utils/f
 interface ShareItSessionViewProps {
   selfPeer: Peer;
   transfers: TransferTask[];
+  encryptionMode?: 'turbo-dtls' | 'dual-crypto';
+  onToggleEncryptionMode?: (mode: 'turbo-dtls' | 'dual-crypto') => void;
   onPause: (id: string) => void;
   onResume: (id: string) => void;
   onCancel: (id: string) => void;
@@ -37,6 +39,8 @@ interface ShareItSessionViewProps {
 export const ShareItSessionView: React.FC<ShareItSessionViewProps> = ({
   selfPeer,
   transfers,
+  encryptionMode = 'turbo-dtls',
+  onToggleEncryptionMode,
   onPause,
   onResume,
   onCancel,
@@ -119,34 +123,56 @@ export const ShareItSessionView: React.FC<ShareItSessionViewProps> = ({
             </span>
           </div>
 
-          {/* Animated Flow Pulse Line */}
+          {/* Animated Flow Pulse Line & Speedometer */}
           <div className="flex-1 flex flex-col items-center px-4">
             <div className="flex items-center gap-2 mb-1.5 text-xs font-mono font-bold text-cyan-600 dark:text-cyan-400">
-              <Zap className="w-3.5 h-3.5" />
-              <span>{currentSpeed > 0 ? formatSpeed(currentSpeed) : 'Direct P2P Link'}</span>
+              <Zap className="w-3.5 h-3.5 animate-pulse text-cyan-500" />
+              <span>{currentSpeed > 0 ? formatSpeed(currentSpeed) : 'Direct P2P Link (Ready)'}</span>
             </div>
 
             <div className="w-full relative flex items-center">
-              <div className="w-full h-1.5 bg-neutral-100 dark:bg-neutral-800 rounded-full overflow-hidden">
+              <div className="w-full h-2 bg-neutral-100 dark:bg-neutral-800 rounded-full overflow-hidden shadow-inner">
                 <div
-                  className="h-full bg-gradient-to-r from-cyan-500 to-emerald-500 rounded-full transition-all duration-300"
+                  className="h-full bg-gradient-to-r from-cyan-500 via-emerald-400 to-teal-400 rounded-full transition-all duration-300"
                   style={{ width: `${overallProgress}%` }}
                 />
               </div>
             </div>
 
-            <div className="flex items-center gap-3 mt-1.5 text-[11px] font-mono text-neutral-500">
+            <div className="flex flex-wrap items-center justify-center gap-2 sm:gap-3 mt-2 text-[11px] font-mono text-neutral-500">
               <span>{formatBytes(transferredBytes)} / {formatBytes(totalBytes)}</span>
               <span aria-hidden="true">·</span>
-              <span>{overallProgress}%</span>
+              <span className="font-bold text-neutral-800 dark:text-neutral-200">{overallProgress}%</span>
               {maxEta > 0 && (
                 <>
                   <span aria-hidden="true">·</span>
-                  <span className="flex items-center gap-1 text-cyan-600 dark:text-cyan-400">
+                  <span className="flex items-center gap-1 text-cyan-600 dark:text-cyan-400 font-semibold">
                     <Clock className="w-3 h-3" />
                     <span>{formatETA(maxEta)}</span>
                   </span>
                 </>
+              )}
+            </div>
+
+            {/* Turbo Hardware Acceleration Mode Badge */}
+            <div className="mt-3 flex items-center gap-2">
+              <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-[10px] font-medium bg-emerald-50 dark:bg-emerald-950/60 text-emerald-700 dark:text-emerald-300 border border-emerald-200 dark:border-emerald-800">
+                <Lock className="w-3 h-3 text-emerald-500" />
+                <span>
+                  {encryptionMode === 'turbo-dtls'
+                    ? '⚡ Turbo Mode: Hardware DTLS AES-256-GCM (15 - 40+ MB/s)'
+                    : '🔒 Dual-Layer Mode: DTLS + WebCrypto AES-GCM'}
+                </span>
+              </span>
+
+              {onToggleEncryptionMode && (
+                <button
+                  type="button"
+                  onClick={() => onToggleEncryptionMode(encryptionMode === 'turbo-dtls' ? 'dual-crypto' : 'turbo-dtls')}
+                  className="text-[10px] text-cyan-600 dark:text-cyan-400 hover:underline font-semibold"
+                >
+                  Switch
+                </button>
               )}
             </div>
           </div>
@@ -200,8 +226,12 @@ export const ShareItSessionView: React.FC<ShareItSessionViewProps> = ({
                         {task.fileName}
                       </h4>
                       {task.isEncrypted && (
-                        <span title="AES-256-GCM Encrypted" className="text-emerald-500">
-                          <Lock className="w-3.5 h-3.5" />
+                        <span
+                          title={task.encryptionMode === 'turbo-dtls' ? 'Hardware-Accelerated WebRTC DTLS AES-256-GCM (Zero JS CPU contention)' : 'Dual-Layer AES-256-GCM'}
+                          className="flex items-center gap-1 text-[10px] font-mono text-emerald-600 dark:text-emerald-400 bg-emerald-50 dark:bg-emerald-950/60 px-1.5 py-0.5 rounded border border-emerald-200 dark:border-emerald-800"
+                        >
+                          <Lock className="w-3 h-3" />
+                          <span>{task.encryptionMode === 'turbo-dtls' ? 'Turbo DTLS' : 'Dual-Crypto'}</span>
                         </span>
                       )}
                     </div>

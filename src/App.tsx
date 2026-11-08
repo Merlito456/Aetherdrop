@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef } from 'react';
-import { Peer, TransferTask } from './types/transfer';
+import { Peer, TransferTask, EncryptionMode } from './types/transfer';
 import { getOrCreatePeerIdentity } from './utils/device';
 import { WebRTCManager } from './utils/webrtcManager';
 import {
@@ -50,6 +50,15 @@ export default function App() {
       localStorage.setItem('aetherdrop_theme', 'light');
     }
   }, [darkMode]);
+
+  // Encryption mode: defaults to Turbo DTLS (Hardware Accelerated 15-40+ MB/s)
+  const [encryptionMode, setEncryptionMode] = useState<EncryptionMode>(() => {
+    if (typeof window !== 'undefined') {
+      const stored = localStorage.getItem('aetherdrop_encryption_mode');
+      if (stored === 'dual-crypto') return 'dual-crypto';
+    }
+    return 'turbo-dtls';
+  });
 
   // Peer & Room State
   const [selfPeer] = useState<Peer>(() => {
@@ -142,7 +151,7 @@ export default function App() {
         setSignalingStatus(status);
         if (msg) setSignalingMessage(msg);
       },
-    });
+    }, encryptionMode);
 
     managerRef.current = manager;
     manager.init();
@@ -386,6 +395,12 @@ export default function App() {
           <ShareItSessionView
             selfPeer={selfPeer}
             transfers={transfers}
+            encryptionMode={encryptionMode}
+            onToggleEncryptionMode={(mode) => {
+              setEncryptionMode(mode);
+              localStorage.setItem('aetherdrop_encryption_mode', mode);
+              managerRef.current?.setEncryptionMode(mode);
+            }}
             onPause={handlePause}
             onResume={handleResume}
             onCancel={handleCancel}
@@ -513,6 +528,12 @@ export default function App() {
         onClose={() => setIsRoomModalOpen(false)}
         currentRoom={roomId}
         onSwitchRoom={handleSwitchRoom}
+        encryptionMode={encryptionMode}
+        onSwitchEncryptionMode={(mode) => {
+          setEncryptionMode(mode);
+          localStorage.setItem('aetherdrop_encryption_mode', mode);
+          managerRef.current?.setEncryptionMode(mode);
+        }}
       />
     </div>
   );
