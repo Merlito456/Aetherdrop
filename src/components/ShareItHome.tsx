@@ -1,4 +1,3 @@
-import React from 'react';
 import {
   Send,
   Download,
@@ -12,8 +11,9 @@ import {
   ArrowRight,
   History,
   Zap,
+  Gauge,
 } from 'lucide-react';
-import { Peer } from '../types/transfer';
+import { Peer, SpeedProfile } from '../types/transfer';
 
 interface ShareItHomeProps {
   selfPeer: Peer;
@@ -31,6 +31,8 @@ interface ShareItHomeProps {
   isTetherMode?: boolean;
   onToggleTetherMode?: (enabled: boolean) => void;
   onTestTetherTransfer?: () => void;
+  speedProfile?: SpeedProfile;
+  onOpenSpeedOptimizer?: () => void;
 }
 
 export const ShareItHome: React.FC<ShareItHomeProps> = ({
@@ -48,6 +50,8 @@ export const ShareItHome: React.FC<ShareItHomeProps> = ({
   isTetherMode = false,
   onToggleTetherMode,
   onTestTetherTransfer,
+  speedProfile = 'turbo-8x',
+  onOpenSpeedOptimizer,
 }) => {
   const getDeviceIcon = () => {
     switch (selfPeer.deviceType) {
@@ -140,23 +144,35 @@ export const ShareItHome: React.FC<ShareItHomeProps> = ({
               <div className="flex items-center gap-2 flex-wrap">
                 <span className="text-xs sm:text-sm font-bold text-neutral-900 dark:text-neutral-100 flex items-center gap-1.5">
                   <Zap className="w-4 h-4 text-cyan-500" />
-                  <span>Wi-Fi Tethering / Mobile Hotspot Boost</span>
+                  <span>Wi-Fi Tethering & Hotspot Boost</span>
                 </span>
                 <span className={`text-[10px] px-2 py-0.2 rounded-full font-bold ${
                   isTetherMode
                     ? 'bg-emerald-600 text-white animate-pulse'
                     : 'bg-neutral-100 dark:bg-neutral-800 text-neutral-600 dark:text-neutral-400'
                 }`}>
-                  {isTetherMode ? '⚡ Unlimited 4x Striped Boost Active' : 'Standard LAN'}
+                  {isTetherMode ? '⚡ 8x Striped Boost Active' : `${speedProfile === 'turbo-8x' ? '8x Turbo' : '4x'} LAN Ready`}
                 </span>
               </div>
               <p className="text-[11px] text-neutral-500 dark:text-neutral-400 mt-0.5 leading-snug">
-                Connect via phone personal hotspot with 4 parallel SCTP channels and zero-hang instant relay (50–120+ MB/s).
+                Uncapped 10 Gbps SDP with 8 parallel SCTP channels and zero-wait memory streaming (80–180+ MB/s).
               </p>
             </div>
           </label>
 
-          <div className="flex items-center gap-2 shrink-0 self-end sm:self-center">
+          <div className="flex items-center gap-2 shrink-0 self-end sm:self-center flex-wrap">
+            {onOpenSpeedOptimizer && (
+              <button
+                type="button"
+                onClick={onOpenSpeedOptimizer}
+                className="px-3 py-1.5 rounded-xl border border-neutral-200 dark:border-neutral-700 hover:bg-neutral-100 dark:hover:bg-neutral-800 text-neutral-700 dark:text-neutral-300 font-bold text-xs flex items-center gap-1.5 shadow-2xs transition-colors cursor-pointer"
+                title="Open Speed & Pipeline Optimizer settings"
+              >
+                <Gauge className="w-3.5 h-3.5 text-cyan-500" />
+                <span>Optimize Speed</span>
+              </button>
+            )}
+
             {onTestTetherTransfer && (
               <button
                 type="button"
@@ -165,11 +181,11 @@ export const ShareItHome: React.FC<ShareItHomeProps> = ({
                 title="Immediately run benchmark tether file transfer"
               >
                 <Zap className="w-3.5 h-3.5 fill-current" />
-                <span>Test Tether Transfer</span>
+                <span>Test Speed</span>
               </button>
             )}
             <span className="text-xs font-mono font-bold text-cyan-600 dark:text-cyan-400 hidden md:inline">
-              {isTetherMode ? '50–120+ MB/s' : '15–40 MB/s'}
+              {isTetherMode ? '80–180+ MB/s' : '40–100+ MB/s'}
             </span>
           </div>
         </div>

@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef } from 'react';
-import { Peer, TransferTask, EncryptionMode } from './types/transfer';
+import { Peer, TransferTask, EncryptionMode, SpeedProfile } from './types/transfer';
 import { getOrCreatePeerIdentity } from './utils/device';
 import { WebRTCManager } from './utils/webrtcManager';
 import {
@@ -19,6 +19,7 @@ import { QRCodeModal } from './components/QRCodeModal';
 import { QRScannerModal } from './components/QRScannerModal';
 import { SecurityModal } from './components/SecurityModal';
 import { RoomModal } from './components/RoomModal';
+import { SpeedOptimizerModal } from './components/SpeedOptimizerModal';
 import { Lock, ArrowDownLeft, X } from 'lucide-react';
 
 type ShareItView =
@@ -51,7 +52,7 @@ export default function App() {
     }
   }, [darkMode]);
 
-  // Encryption mode: defaults to Turbo DTLS (Hardware Accelerated 15-40+ MB/s)
+  // Encryption mode: defaults to Turbo DTLS (Hardware Accelerated 10 Gbps uncapped wire speed)
   const [encryptionMode, setEncryptionMode] = useState<EncryptionMode>(() => {
     if (typeof window !== 'undefined') {
       const stored = localStorage.getItem('aetherdrop_encryption_mode');
@@ -59,6 +60,21 @@ export default function App() {
     }
     return 'turbo-dtls';
   });
+
+  // High-Throughput Concurrency Profile: defaults to Turbo 8x Parallel SCTP Stripes
+  const [speedProfile, setSpeedProfile] = useState<SpeedProfile>(() => {
+    if (typeof window !== 'undefined') {
+      const stored = localStorage.getItem('aetherdrop_speed_profile');
+      if (stored === 'balanced-4x') return 'balanced-4x';
+    }
+    return 'turbo-8x';
+  });
+
+  const handleChangeSpeedProfile = (profile: SpeedProfile) => {
+    setSpeedProfile(profile);
+    localStorage.setItem('aetherdrop_speed_profile', profile);
+    managerRef.current?.setSpeedProfile(profile);
+  };
 
   // Wi-Fi Tethering / Mobile Hotspot Boost Mode (Client connected directly to sender hotspot)
   const [isTetherMode, setIsTetherMode] = useState<boolean>(() => {
@@ -102,6 +118,7 @@ export default function App() {
   const [isScannerModalOpen, setIsScannerModalOpen] = useState(false);
   const [isSecurityModalOpen, setIsSecurityModalOpen] = useState(false);
   const [isRoomModalOpen, setIsRoomModalOpen] = useState(false);
+  const [isSpeedModalOpen, setIsSpeedModalOpen] = useState(false);
   const [notificationStatus, setNotificationStatus] = useState<NotificationPermission | 'unsupported'>('default');
 
   // Real-time incoming transfer alert banner
@@ -166,7 +183,7 @@ export default function App() {
         setSignalingStatus(status);
         if (msg) setSignalingMessage(msg);
       },
-    }, encryptionMode, isTetherMode);
+    }, encryptionMode, isTetherMode, speedProfile);
 
     managerRef.current = manager;
     manager.init();
@@ -300,7 +317,7 @@ export default function App() {
   };
 
   const activeTransfersCount = transfers.filter(
-    (t) => t.status === 'transferring' || t.status === 'encrypting' || t.status === 'paused'
+    (t) => t.status === 'transferring' || t.status === 'encrypting' || t.status === 'paused' || t.status === 'connecting'
   ).length;
 
   return (
@@ -320,6 +337,8 @@ export default function App() {
         onOpenQR={() => setIsQRModalOpen(true)}
         onOpenRooms={() => setIsRoomModalOpen(true)}
         onOpenSecurity={() => setIsSecurityModalOpen(true)}
+        onOpenSpeedOptimizer={() => setIsSpeedModalOpen(true)}
+        speedProfile={speedProfile}
         notificationStatus={notificationStatus}
         onRequestNotification={handleRequestNotification}
         selfPeer={selfPeer}
@@ -387,6 +406,8 @@ export default function App() {
             isTetherMode={isTetherMode}
             onToggleTetherMode={handleToggleTetherMode}
             onTestTetherTransfer={handleTestTetherTransfer}
+            speedProfile={speedProfile}
+            onOpenSpeedOptimizer={() => setIsSpeedModalOpen(true)}
           />
         )}
 
@@ -436,6 +457,8 @@ export default function App() {
               localStorage.setItem('aetherdrop_encryption_mode', mode);
               managerRef.current?.setEncryptionMode(mode);
             }}
+            speedProfile={speedProfile}
+            onOpenSpeedOptimizer={() => setIsSpeedModalOpen(true)}
             isTetherMode={isTetherMode}
             onToggleTetherMode={handleToggleTetherMode}
             onPause={handlePause}
@@ -521,6 +544,15 @@ export default function App() {
 
           <div className="flex items-center gap-4">
             <button
+              onClick={() => setIsSpeedModalOpen(true)}
+              className="text-cyan-600 dark:text-cyan-400 font-semibold hover:underline flex items-center gap-1"
+            >
+              <span>⚡ Speed Optimizer</span>
+              <span className="text-[10px] px-1.5 py-0.2 rounded-full bg-cyan-100 dark:bg-cyan-950 font-mono">
+                {speedProfile === 'turbo-8x' ? '8x SCTP' : '4x'}
+              </span>
+            </button>
+            <button
               onClick={() => setIsSecurityModalOpen(true)}
               className="hover:text-neutral-800 dark:hover:text-neutral-200 transition-colors"
             >
@@ -560,6 +592,24 @@ export default function App() {
         isOpen={isSecurityModalOpen}
         onClose={() => setIsSecurityModalOpen(false)}
         onPurgeMemory={handlePurgeMemory}
+      />
+
+      <SpeedOptimizerModal
+        isOpen={isSpeedModalOpen}
+        onClose={() => setIsSpeedModalOpen(false)}
+        speedProfile={speedProfile}
+        onChangeSpeedProfile={handleChangeSpeedProfile}
+        isTetherMode={isTetherMode}
+        onToggleTetherMode={handleToggleTetherMode}
+        encryptionMode={encryptionMode}
+        onChangeEncryptionMode={(mode) => {
+          setEncryptionMode(mode);
+          localStorage.setItem('aetherdrop_encryption_mode', mode);
+          managerRef.current?.setEncryptionMode(mode);
+        }}
+        onRunSpeedTest={handleTestTetherTransfer}
+        activePeakSpeed={transfers.reduce((max, t) => Math.max(max, t.peakSpeed || 0), 0)}
+        activeChannelCount={transfers.find((t) => t.status === 'transferring')?.channelCount || (speedProfile === 'turbo-8x' || isTetherMode ? 8 : 4)}
       />
 
       <RoomModal

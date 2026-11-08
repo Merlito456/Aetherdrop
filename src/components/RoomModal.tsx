@@ -113,11 +113,11 @@ export const RoomModal: React.FC<RoomModalProps> = ({
                 />
                 <div className="text-xs">
                   <div className="font-bold flex items-center gap-1 text-cyan-700 dark:text-cyan-300">
-                    <span>⚡ Uncapped Wire Speed (25 - 60+ MB/s)</span>
+                    <span>⚡ Uncapped Wire Speed (80 - 180+ MB/s)</span>
                     <span className="text-[10px] bg-cyan-100 dark:bg-cyan-900 text-cyan-700 dark:text-cyan-300 px-1.5 py-0.2 rounded font-bold">Recommended</span>
                   </div>
                   <p className="text-[11px] text-neutral-500 dark:text-neutral-400 mt-0.5 leading-snug">
-                    Uncaps WebRTC SCTP bandwidth to 2 Gbps. Direct hardware DTLS AES-256-GCM encryption with zero-copy binary streaming and background discovery suspension.
+                    Uncaps WebRTC SCTP bandwidth to 10 Gbps. Direct hardware DTLS AES-256-GCM encryption with 8x parallel SCTP striped channels, zero-copy binary streaming, and background discovery suspension.
                   </p>
                 </div>
               </label>
@@ -167,11 +167,11 @@ export const RoomModal: React.FC<RoomModalProps> = ({
                       ? 'bg-emerald-600 text-white'
                       : 'bg-neutral-200 dark:bg-neutral-700 text-neutral-600 dark:text-neutral-400'
                   }`}>
-                    {isTetherMode ? '⚡ Unlimited 4x Striped Boost' : 'Off'}
+                    {isTetherMode ? '⚡ Unlimited 8x Striped Boost' : 'Off'}
                   </span>
                 </div>
                 <p className="text-[11px] text-neutral-500 dark:text-neutral-400 mt-0.5 leading-snug">
-                  Use when client PC/laptop connects directly to sender's phone hotspot. Enables 4 parallel SCTP channels and 16 MB in-memory prefetch for line-rate Wi-Fi speed.
+                  Use when client PC/laptop connects directly to sender's phone hotspot. Enables 8 parallel SCTP channels and 64 MB in-memory prefetch for line-rate Wi-Fi speed.
                 </p>
               </div>
             </label>

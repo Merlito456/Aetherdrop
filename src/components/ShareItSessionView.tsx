@@ -22,7 +22,7 @@ import {
   Code,
   RotateCcw,
 } from 'lucide-react';
-import { TransferTask, Peer } from '../types/transfer';
+import { TransferTask, Peer, SpeedProfile } from '../types/transfer';
 import { formatBytes, formatSpeed, formatETA, getFileCategory } from '../utils/formatters';
 
 interface ShareItSessionViewProps {
@@ -30,6 +30,8 @@ interface ShareItSessionViewProps {
   transfers: TransferTask[];
   encryptionMode?: 'turbo-dtls' | 'dual-crypto';
   onToggleEncryptionMode?: (mode: 'turbo-dtls' | 'dual-crypto') => void;
+  speedProfile?: SpeedProfile;
+  onOpenSpeedOptimizer?: () => void;
   isTetherMode?: boolean;
   onToggleTetherMode?: (enabled: boolean) => void;
   onPause: (id: string) => void;
@@ -46,6 +48,8 @@ export const ShareItSessionView: React.FC<ShareItSessionViewProps> = ({
   transfers,
   encryptionMode = 'turbo-dtls',
   onToggleEncryptionMode,
+  speedProfile = 'turbo-8x',
+  onOpenSpeedOptimizer,
   isTetherMode = false,
   onToggleTetherMode,
   onPause,
@@ -68,7 +72,7 @@ export const ShareItSessionView: React.FC<ShareItSessionViewProps> = ({
   const currentSpeed = activeTransfers.reduce((sum, t) => sum + t.speed, 0);
   const maxEta = activeTransfers.reduce((max, t) => Math.max(max, t.eta), 0);
   const maxPeakSpeed = transfers.reduce((max, t) => Math.max(max, t.peakSpeed || 0), 0);
-  const activeChannelCount = transfers.find((t) => t.status === 'transferring')?.channelCount || (isTetherMode ? 4 : 1);
+  const activeChannelCount = transfers.find((t) => t.status === 'transferring')?.channelCount || (speedProfile === 'turbo-8x' || isTetherMode ? 8 : 4);
 
   // Identify remote peer
   const remotePeerName = transfers[0]?.peerName || 'Connected Device';
@@ -99,7 +103,7 @@ export const ShareItSessionView: React.FC<ShareItSessionViewProps> = ({
       <div className="flex items-center justify-between pb-2 border-b border-neutral-200 dark:border-neutral-800">
         <button
           onClick={onExitSession}
-          className="p-2 rounded-xl border border-neutral-200 dark:border-neutral-700 hover:bg-neutral-100 dark:hover:bg-neutral-800 text-neutral-700 dark:text-neutral-300 transition-colors flex items-center gap-1.5 text-xs font-semibold"
+          className="p-2 rounded-xl border border-neutral-200 dark:border-neutral-700 hover:bg-neutral-100 dark:hover:bg-neutral-800 text-neutral-700 dark:text-neutral-300 transition-colors flex items-center gap-1.5 text-xs font-semibold cursor-pointer"
         >
           <ArrowLeft className="w-4 h-4" />
           <span>Home</span>
@@ -109,13 +113,25 @@ export const ShareItSessionView: React.FC<ShareItSessionViewProps> = ({
           Transfer Session
         </h2>
 
-        <button
-          onClick={onSendMore}
-          className="px-3 py-1.5 rounded-xl bg-cyan-600 hover:bg-cyan-500 text-white font-semibold text-xs flex items-center gap-1.5 shadow-xs"
-        >
-          <Plus className="w-4 h-4" />
-          <span>Send More</span>
-        </button>
+        <div className="flex items-center gap-2">
+          {onOpenSpeedOptimizer && (
+            <button
+              onClick={onOpenSpeedOptimizer}
+              className="px-3 py-1.5 rounded-xl border border-cyan-500/50 hover:bg-cyan-50 dark:hover:bg-cyan-950/40 text-cyan-600 dark:text-cyan-400 font-semibold text-xs flex items-center gap-1.5 shadow-xs cursor-pointer"
+            >
+              <Zap className="w-3.5 h-3.5 fill-current" />
+              <span>Speed Optimizer</span>
+            </button>
+          )}
+
+          <button
+            onClick={onSendMore}
+            className="px-3 py-1.5 rounded-xl bg-cyan-600 hover:bg-cyan-500 text-white font-semibold text-xs flex items-center gap-1.5 shadow-xs cursor-pointer"
+          >
+            <Plus className="w-4 h-4" />
+            <span>Send More</span>
+          </button>
+        </div>
       </div>
 
       {/* SHAREit Bilateral Device Connection Strip */}
@@ -188,12 +204,20 @@ export const ShareItSessionView: React.FC<ShareItSessionViewProps> = ({
                 <Lock className="w-3 h-3 text-emerald-500" />
                 <span>
                   {encryptionMode === 'turbo-dtls'
-                    ? '⚡ Hardware DTLS AES-256-GCM (5 Gbps Uncapped Wire Speed)'
+                    ? '⚡ Hardware DTLS AES-256-GCM (10 Gbps Uncapped)'
                     : '🔒 Dual-Layer Mode: DTLS + WebCrypto AES-GCM'}
                 </span>
               </span>
 
-              {onToggleEncryptionMode && (
+              {onOpenSpeedOptimizer ? (
+                <button
+                  type="button"
+                  onClick={onOpenSpeedOptimizer}
+                  className="text-[10px] text-cyan-600 dark:text-cyan-400 hover:underline font-bold flex items-center gap-1"
+                >
+                  <span>⚡ Tune {speedProfile === 'turbo-8x' ? '8x Turbo' : '4x'}</span>
+                </button>
+              ) : onToggleEncryptionMode ? (
                 <button
                   type="button"
                   onClick={() => onToggleEncryptionMode(encryptionMode === 'turbo-dtls' ? 'dual-crypto' : 'turbo-dtls')}
@@ -201,7 +225,7 @@ export const ShareItSessionView: React.FC<ShareItSessionViewProps> = ({
                 >
                   Switch
                 </button>
-              )}
+              ) : null}
             </div>
 
             {/* User-Requested Wi-Fi Tethering / Direct Hotspot Connection Mode Checkbox */}
@@ -230,11 +254,11 @@ export const ShareItSessionView: React.FC<ShareItSessionViewProps> = ({
                             : 'bg-neutral-200 dark:bg-neutral-700 text-neutral-600 dark:text-neutral-300'
                         }`}
                       >
-                        {isTetherMode ? 'Unlimited 4x Striped Boost Active' : 'Off'}
+                        {isTetherMode ? 'Unlimited 8x Striped Boost Active' : 'Off'}
                       </span>
                     </span>
                     <span className="text-[11px] text-neutral-500 dark:text-neutral-400 leading-snug mt-0.5">
-                      Direct local host connection with 4 parallel SCTP channels and 16 MB in-memory prefetch for maximum uncapped line rate (50–120+ MB/s).
+                      Direct local host connection with 8 parallel SCTP channels and 64 MB in-memory prefetch for maximum line rate (80–180+ MB/s).
                     </span>
                   </div>
                 </div>
@@ -244,7 +268,7 @@ export const ShareItSessionView: React.FC<ShareItSessionViewProps> = ({
                       isTetherMode ? 'text-cyan-600 dark:text-cyan-400' : 'text-neutral-400'
                     }`}
                   >
-                    {isTetherMode ? '4x Striped Streams' : 'Standard LAN'}
+                    {isTetherMode ? '8x Striped Streams' : 'Standard LAN'}
                   </span>
                 </div>
               </label>

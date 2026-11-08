@@ -1,4 +1,3 @@
-import React from 'react';
 import {
   ShieldCheck,
   Moon,
@@ -10,8 +9,10 @@ import {
   Smartphone,
   Tablet,
   Share2,
+  Gauge,
+  Zap,
 } from 'lucide-react';
-import { Peer } from '../types/transfer';
+import { Peer, SpeedProfile } from '../types/transfer';
 
 interface TopBarProps {
   currentTab: 'transfers' | 'radar' | 'security' | 'rooms';
@@ -22,6 +23,8 @@ interface TopBarProps {
   onOpenQR: () => void;
   onOpenRooms: () => void;
   onOpenSecurity: () => void;
+  onOpenSpeedOptimizer?: () => void;
+  speedProfile?: SpeedProfile;
   notificationStatus: NotificationPermission | 'unsupported';
   onRequestNotification: () => void;
   selfPeer: Peer;
@@ -36,6 +39,8 @@ export const TopBar: React.FC<TopBarProps> = ({
   onOpenQR,
   onOpenRooms,
   onOpenSecurity,
+  onOpenSpeedOptimizer,
+  speedProfile = 'turbo-8x',
   notificationStatus,
   onRequestNotification,
   selfPeer,
@@ -118,12 +123,37 @@ export const TopBar: React.FC<TopBarProps> = ({
             className="text-neutral-600 dark:text-neutral-400 hover:text-neutral-900 dark:hover:text-neutral-100 transition-colors whitespace-nowrap shrink-0 flex items-center gap-1.5 py-1"
           >
             <ShieldCheck className="w-4 h-4 text-emerald-500" />
-            <span>Zero-Cache Security</span>
+            <span>Zero-Cache</span>
           </button>
+
+          {onOpenSpeedOptimizer && (
+            <button
+              onClick={onOpenSpeedOptimizer}
+              className="text-cyan-600 dark:text-cyan-400 hover:text-cyan-700 dark:hover:text-cyan-300 transition-colors whitespace-nowrap shrink-0 flex items-center gap-1.5 py-1 font-semibold"
+            >
+              <Zap className="w-4 h-4 text-cyan-500 fill-current" />
+              <span>Speed Optimizer</span>
+              <span className="text-[10px] px-1.5 py-0.2 rounded-full bg-cyan-100 dark:bg-cyan-950 font-mono font-bold">
+                {speedProfile === 'turbo-8x' ? '8x SCTP' : '4x'}
+              </span>
+            </button>
+          )}
         </nav>
 
         {/* Zone 3: Primary Actions & Utilities */}
         <div className="flex items-center gap-2 sm:gap-3 shrink-0">
+          {/* Speed Optimizer quick button */}
+          {onOpenSpeedOptimizer && (
+            <button
+              onClick={onOpenSpeedOptimizer}
+              title="Speed & Pipeline Optimizer"
+              className="p-2 text-cyan-600 dark:text-cyan-400 hover:bg-cyan-50 dark:hover:bg-cyan-950/40 rounded-lg transition-colors flex items-center gap-1"
+              aria-label="Speed Optimizer"
+            >
+              <Gauge className="w-4 h-4" />
+            </button>
+          )}
+
           {/* QR Code Quick Pair Button */}
           <button
             onClick={onOpenQR}
@@ -208,6 +238,15 @@ export const TopBar: React.FC<TopBarProps> = ({
         >
           <span>Nearby Radar</span>
         </button>
+
+        {onOpenSpeedOptimizer && (
+          <button
+            onClick={onOpenSpeedOptimizer}
+            className="flex flex-col items-center gap-0.5 py-1 px-3 rounded-md text-cyan-600 dark:text-cyan-400 font-semibold"
+          >
+            <span>Speed ⚡</span>
+          </button>
+        )}
 
         <button
           onClick={onOpenRooms}

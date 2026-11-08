@@ -40,14 +40,14 @@ export const TransferList: React.FC<TransferListProps> = ({
   const [filter, setFilter] = useState<'all' | 'active' | 'completed' | 'paused'>('all');
 
   const filteredTransfers = transfers.filter((t) => {
-    if (filter === 'active') return t.status === 'transferring' || t.status === 'encrypting';
+    if (filter === 'active') return t.status === 'transferring' || t.status === 'encrypting' || t.status === 'connecting';
     if (filter === 'completed') return t.status === 'completed';
     if (filter === 'paused') return t.status === 'paused' || t.status === 'cancelled';
     return true;
   });
 
   const activeCount = transfers.filter(
-    (t) => t.status === 'transferring' || t.status === 'encrypting'
+    (t) => t.status === 'transferring' || t.status === 'encrypting' || t.status === 'connecting'
   ).length;
 
   const completedCount = transfers.filter((t) => t.status === 'completed').length;
@@ -74,6 +74,13 @@ export const TransferList: React.FC<TransferListProps> = ({
 
   const getStatusBadge = (task: TransferTask) => {
     switch (task.status) {
+      case 'connecting':
+        return (
+          <span className="text-[11px] font-medium text-cyan-600 dark:text-cyan-400 flex items-center gap-1.5">
+            <span className="w-2 h-2 rounded-full bg-cyan-500 animate-ping" />
+            <span>Connecting...</span>
+          </span>
+        );
       case 'encrypting':
         return (
           <span className="text-[11px] font-medium text-amber-600 dark:text-amber-400 flex items-center gap-1">

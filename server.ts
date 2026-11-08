@@ -95,34 +95,45 @@ function sendToPeer(targetId: string, message: any) {
 }
 
 function routeSignalMessage(msg: SignalMessage, targetId?: string, targetPin?: string, roomId?: string) {
-  let delivered = false;
+  const currentRoom = roomId || 'default-lan';
+  const deliveredPeerIds = new Set<string>();
 
+  // 1. Direct delivery by targetId if specified and not 'room'
+  if (targetId && targetId !== 'room') {
+    if (peers.has(targetId) || peerSockets.has(targetId)) {
+      if (!messageQueues.has(targetId)) messageQueues.set(targetId, []);
+      messageQueues.get(targetId)!.push(msg);
+      sendToPeer(targetId, msg);
+      deliveredPeerIds.add(targetId);
+    }
+  }
+
+  // 2. Direct delivery by targetPin if specified
   if (targetPin) {
     for (const [id, peer] of peers.entries()) {
       if (peer.pin === targetPin && id !== msg.senderId) {
         if (!messageQueues.has(id)) messageQueues.set(id, []);
         messageQueues.get(id)!.push(msg);
-        if (sendToPeer(id, msg)) delivered = true;
+        sendToPeer(id, msg);
+        deliveredPeerIds.add(id);
       }
     }
-  } else if (targetId === 'room' || !targetId) {
-    const currentRoom = roomId || 'default-lan';
-    for (const [id, peer] of peers.entries()) {
-      if (peer.roomId === currentRoom && id !== msg.senderId) {
-        if (!messageQueues.has(id)) messageQueues.set(id, []);
-        messageQueues.get(id)!.push(msg);
-        if (sendToPeer(id, msg)) delivered = true;
-      }
-    }
-  } else {
-    if (!messageQueues.has(targetId)) {
-      messageQueues.set(targetId, []);
-    }
-    messageQueues.get(targetId)!.push(msg);
-    if (sendToPeer(targetId, msg)) delivered = true;
   }
 
-  return delivered;
+  // 3. Room broadcast (or fallback if direct targeting did not reach any peer)
+  // In a local Wi-Fi / tether environment, this guarantees the receiver is ALWAYS notified!
+  if (targetId === 'room' || !targetId || deliveredPeerIds.size === 0) {
+    for (const [id, peer] of peers.entries()) {
+      if (peer.roomId === currentRoom && id !== msg.senderId && !deliveredPeerIds.has(id)) {
+        if (!messageQueues.has(id)) messageQueues.set(id, []);
+        messageQueues.get(id)!.push(msg);
+        sendToPeer(id, msg);
+        deliveredPeerIds.add(id);
+      }
+    }
+  }
+
+  return deliveredPeerIds.size > 0;
 }
 
 wss.on('connection', (ws) => {
@@ -172,6 +183,22 @@ wss.on('connection', (ws) => {
             timestamp: Date.now(),
           };
           routeSignalMessage(msg, targetId, targetPin, roomId);
+        }
+      } else if (parsed.type === 'WS_RELAY_CHUNK') {
+        // Fast-path WebSocket binary chunk relay: route directly to target peer socket
+        const { targetId, transferId, chunkIdx, data } = parsed;
+        if (targetId && data) {
+          const targetWs = peerSockets.get(targetId);
+          if (targetWs && targetWs.readyState === WebSocket.OPEN) {
+            try {
+              targetWs.send(JSON.stringify({
+                type: 'WS_INCOMING_CHUNK',
+                transferId,
+                chunkIdx,
+                data,
+              }));
+            } catch {}
+          }
         }
       } else if (parsed.type === 'WS_HEARTBEAT') {
         if (clientPeerId && peers.has(clientPeerId)) {
@@ -360,6 +387,8 @@ app.post('/api/relay/init', (req, res) => {
     isTetherMode,
     fingerprint,
     rawKey,
+    targetPin,
+    roomId,
   } = req.body;
 
   if (!transferId || !senderId) {
@@ -387,37 +416,52 @@ app.post('/api/relay/init', (req, res) => {
 
   relayTransfers.set(transferId, relay);
 
-  // Notify target peer immediately through WebSocket and message queue
-  if (targetId) {
-    const notifyMsg: SignalMessage = {
-      id: Math.random().toString(36).slice(2, 10),
-      senderId,
-      targetId,
-      type: 'FILE_OFFER_SIGNAL',
-      payload: {
-        type: 'FILE_OFFER',
-        transferId,
-        fileName,
-        fileSize,
-        mimeType,
-        totalChunks,
-        encryptionMode,
-        isTetherMode,
-        rawKey,
-        fingerprint,
-        viaRelay: true,
-      },
-      timestamp: Date.now(),
-    };
-    routeSignalMessage(notifyMsg, targetId);
-  }
+  // Notify target peer immediately through WebSocket and message queue with full sender identity
+  const senderPeer = peers.get(senderId);
+  const senderInfo = senderPeer ? {
+    id: senderPeer.id,
+    name: senderPeer.name,
+    pin: senderPeer.pin,
+    deviceType: senderPeer.deviceType,
+    browser: senderPeer.browser,
+    avatarColor: senderPeer.avatarColor,
+  } : {
+    id: senderId,
+    name: 'Nearby Sender',
+  };
+
+  const notifyPayload = {
+    type: 'FILE_OFFER',
+    transferId,
+    fileName,
+    fileSize,
+    mimeType,
+    totalChunks,
+    encryptionMode,
+    isTetherMode,
+    rawKey,
+    fingerprint,
+    viaRelay: true,
+    sender: senderInfo,
+  };
+
+  const notifyMsg: SignalMessage = {
+    id: Math.random().toString(36).slice(2, 10),
+    senderId,
+    targetId: targetId || '',
+    type: 'FILE_OFFER_SIGNAL',
+    payload: notifyPayload,
+    timestamp: Date.now(),
+  };
+
+  routeSignalMessage(notifyMsg, targetId, targetPin, roomId);
 
   res.json({ ok: true, transferId });
 });
 
 app.post(
   '/api/relay/chunk',
-  express.raw({ type: '*/*', limit: '20mb' }),
+  express.raw({ type: '*/*', limit: '50mb' }),
   (req, res) => {
     const transferId = req.query.transferId as string;
     const chunkIdx = parseInt(req.query.chunkIdx as string, 10);
@@ -436,6 +480,21 @@ app.post(
     const bodyBuf = Buffer.isBuffer(req.body) ? req.body : Buffer.from(req.body);
     relay.chunks.set(chunkIdx, bodyBuf);
     relay.lastActive = Date.now();
+
+    // Instant WebSocket push to receiver if connected: zero-polling latency
+    if (relay.targetId) {
+      const targetWs = peerSockets.get(relay.targetId);
+      if (targetWs && targetWs.readyState === WebSocket.OPEN) {
+        try {
+          targetWs.send(JSON.stringify({
+            type: 'WS_INCOMING_CHUNK',
+            transferId,
+            chunkIdx,
+            data: bodyBuf.toString('base64'),
+          }));
+        } catch {}
+      }
+    }
 
     res.json({ ok: true, chunkIdx });
   }

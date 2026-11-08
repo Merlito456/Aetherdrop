@@ -24,6 +24,7 @@ export type TransferStatus =
 
 export type EncryptionMode = 'turbo-dtls' | 'dual-crypto';
 export type TransportType = 'webrtc-striped' | 'webrtc-direct' | 'relay-stream' | 'broadcast-channel' | 'simulated';
+export type SpeedProfile = 'turbo-8x' | 'balanced-4x';
 
 export interface TransferTask {
   id: string;
@@ -37,8 +38,10 @@ export interface TransferTask {
   progress: number; // 0 - 100
   speed: number; // bytes/sec
   peakSpeed?: number; // highest bytes/sec attained
+  averageSpeed?: number; // average overall bytes/sec
   channelCount?: number; // active parallel SCTP stripes
   transportType?: TransportType;
+  speedProfile?: SpeedProfile;
   eta: number; // seconds remaining
   status: TransferStatus;
   errorReason?: string;
