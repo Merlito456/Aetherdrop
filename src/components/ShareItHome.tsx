@@ -12,6 +12,7 @@ import {
   History,
   Zap,
   Gauge,
+  KeyRound,
 } from 'lucide-react';
 import { Peer, SpeedProfile } from '../types/transfer';
 
@@ -33,6 +34,7 @@ interface ShareItHomeProps {
   onTestTetherTransfer?: () => void;
   speedProfile?: SpeedProfile;
   onOpenSpeedOptimizer?: () => void;
+  onOpenPinModal?: () => void;
 }
 
 export const ShareItHome: React.FC<ShareItHomeProps> = ({
@@ -52,6 +54,7 @@ export const ShareItHome: React.FC<ShareItHomeProps> = ({
   onTestTetherTransfer,
   speedProfile = 'turbo-8x',
   onOpenSpeedOptimizer,
+  onOpenPinModal,
 }) => {
   const getDeviceIcon = () => {
     switch (selfPeer.deviceType) {
@@ -102,10 +105,22 @@ export const ShareItHome: React.FC<ShareItHomeProps> = ({
         </div>
 
         <div className="flex items-center gap-2">
+          {/* Quick Connect by PIN Button */}
+          {onOpenPinModal && (
+            <button
+              onClick={onOpenPinModal}
+              className="px-3 py-1.5 rounded-xl border border-cyan-300 dark:border-cyan-800 bg-cyan-50/80 dark:bg-cyan-950/60 hover:bg-cyan-100 text-xs font-semibold text-cyan-700 dark:text-cyan-300 transition-colors flex items-center gap-1.5 cursor-pointer"
+              title="Connect with nearby peer's 4-digit PIN"
+            >
+              <KeyRound className="w-4 h-4 text-cyan-600 dark:text-cyan-400" />
+              <span>Connect PIN</span>
+            </button>
+          )}
+
           {/* Show QR Button */}
           <button
             onClick={onOpenQR}
-            className="px-3 py-1.5 rounded-xl border border-neutral-200 dark:border-neutral-700 hover:bg-neutral-100 dark:hover:bg-neutral-800 text-xs font-semibold text-neutral-700 dark:text-neutral-300 transition-colors flex items-center gap-1.5"
+            className="px-3 py-1.5 rounded-xl border border-neutral-200 dark:border-neutral-700 hover:bg-neutral-100 dark:hover:bg-neutral-800 text-xs font-semibold text-neutral-700 dark:text-neutral-300 transition-colors flex items-center gap-1.5 cursor-pointer"
           >
             <QrCode className="w-4 h-4" />
             <span>My QR</span>
@@ -114,7 +129,7 @@ export const ShareItHome: React.FC<ShareItHomeProps> = ({
           {/* Test peer toggle for quick local testing */}
           <button
             onClick={() => onToggleSimulatedPeer(!simulatedPeerEnabled)}
-            className={`text-xs px-3 py-1.5 rounded-xl font-medium transition-colors flex items-center gap-1.5 ${
+            className={`text-xs px-3 py-1.5 rounded-xl font-medium transition-colors flex items-center gap-1.5 cursor-pointer ${
               simulatedPeerEnabled
                 ? 'bg-cyan-50 dark:bg-cyan-950/60 text-cyan-700 dark:text-cyan-300 border border-cyan-300 dark:border-cyan-800'
                 : 'border border-neutral-200 dark:border-neutral-700 text-neutral-600 dark:text-neutral-400 hover:bg-neutral-100 dark:hover:bg-neutral-800'
@@ -206,6 +221,42 @@ export const ShareItHome: React.FC<ShareItHomeProps> = ({
           </div>
         )}
       </div>
+
+      {/* Quick Connect with 4-Digit PIN Card */}
+      {onOpenPinModal && (
+        <div className="bg-white dark:bg-neutral-900 rounded-3xl border border-neutral-200 dark:border-neutral-800 p-5 shadow-xs flex flex-col sm:flex-row sm:items-center justify-between gap-4">
+          <div className="flex items-center gap-3.5">
+            <div className="w-12 h-12 rounded-2xl bg-cyan-50 dark:bg-cyan-950/60 border border-cyan-200 dark:border-cyan-800 flex items-center justify-center text-cyan-600 dark:text-cyan-400 shrink-0 shadow-xs">
+              <KeyRound className="w-6 h-6 stroke-[2.2]" />
+            </div>
+            <div>
+              <div className="flex items-center gap-2 flex-wrap">
+                <h4 className="text-sm font-bold text-neutral-900 dark:text-neutral-100">
+                  Connect via 4-Digit PIN
+                </h4>
+                <span className="text-[10px] font-mono font-bold px-2 py-0.5 rounded-full bg-cyan-100 dark:bg-cyan-950 text-cyan-700 dark:text-cyan-300">
+                  Instant Pairing
+                </span>
+              </div>
+              <p className="text-xs text-neutral-500 dark:text-neutral-400 mt-0.5">
+                Type the 4-digit code shown on the receiver screen to connect directly
+              </p>
+            </div>
+          </div>
+
+          <div className="flex items-center gap-3 shrink-0">
+            <button
+              type="button"
+              onClick={onOpenPinModal}
+              className="w-full sm:w-auto px-4 py-2.5 rounded-xl bg-gradient-to-r from-cyan-600 to-blue-600 hover:from-cyan-500 hover:to-blue-500 text-white font-bold text-xs flex items-center justify-center gap-2 shadow-sm shadow-cyan-600/20 transition-all cursor-pointer active:scale-98"
+            >
+              <KeyRound className="w-3.5 h-3.5" />
+              <span>Enter 4-Digit PIN</span>
+              <ArrowRight className="w-3.5 h-3.5" />
+            </button>
+          </div>
+        </div>
+      )}
 
       {/* SHAREit Two Big Action Buttons */}
       <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 sm:gap-6">

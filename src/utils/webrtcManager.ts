@@ -58,6 +58,7 @@ export interface WebRTCManagerCallbacks {
   onTransferCompleted: (transfer: TransferTask) => void;
   onIncomingOffer: (transfer: TransferTask) => void;
   onSignalingStatus?: (status: 'connected' | 'connecting' | 'offline', message?: string) => void;
+  onPeerConnectedByPin?: (peer: Peer) => void;
 }
 
 export class WebRTCManager {
@@ -85,6 +86,7 @@ export class WebRTCManager {
   private dataChannelWaiters = new Map<string, Array<(dc: RTCDataChannel) => void>>();
   private fileAcceptWaiters = new Map<string, (accepted: boolean) => void>();
   private pendingIceCandidates = new Map<string, RTCIceCandidateInit[]>();
+  private pinWaiters = new Map<string, Array<(peer: Peer) => void>>();
 
   // Peers & Active Transfers
   private peers = new Map<string, Peer>();
@@ -740,8 +742,47 @@ export class WebRTCManager {
       this.peers.delete(sender.id);
       this.peerHeartbeats.delete(sender.id);
       this.broadcastPeersList();
-    } else if (type === 'CONNECT_REQUEST') {
-      await this.initiateWebRTCConnection(sender.id, true);
+    } else if (type === 'PIN_CONNECT_REQUEST' || (type === 'CONNECT_REQUEST' && (!packet.targetPin || packet.targetPin === this.selfPeer.pin))) {
+      // Direct PIN pair initiated by a sender or receiver
+      const incomingPeer: Peer = {
+        ...sender,
+        status: 'connected',
+        connectionType: 'webrtc-direct',
+      };
+      this.peers.set(sender.id, incomingPeer);
+      this.peerHeartbeats.set(sender.id, Date.now());
+      this.broadcastPeersList();
+      this.callbacks.onPeerConnectedByPin?.(incomingPeer);
+
+      // Immediately acknowledge PIN pairing so sender gets receiver's full profile
+      this.sendSignalingMessage({ peerId: sender.id, pin: sender.pin }, {
+        type: 'PIN_CONNECT_ACK',
+        targetPin: sender.pin,
+        peer: this.selfPeer,
+        sender: this.selfPeer,
+      });
+
+      // Eagerly connect WebRTC DataChannel
+      await this.initiateWebRTCConnection(sender.id, false);
+    } else if (type === 'PIN_CONNECT_ACK') {
+      const remotePeer: Peer = {
+        ...(packet.peer || sender),
+        status: 'connected',
+        connectionType: 'webrtc-direct',
+      };
+      this.peers.set(remotePeer.id, remotePeer);
+      this.peerHeartbeats.set(remotePeer.id, Date.now());
+      this.broadcastPeersList();
+
+      const waiters = this.pinWaiters.get(remotePeer.pin) || [];
+      for (const w of waiters) {
+        try { w(remotePeer); } catch {}
+      }
+      this.pinWaiters.delete(remotePeer.pin);
+      this.callbacks.onPeerConnectedByPin?.(remotePeer);
+
+      // Ensure WebRTC connection is active
+      await this.initiateWebRTCConnection(remotePeer.id, true);
     } else if (type === 'OFFER') {
       await this.handleWebRTCOffer(sender.id, packet.sdp);
     } else if (type === 'ANSWER') {
@@ -789,36 +830,110 @@ export class WebRTCManager {
     }
   }
 
-  public connectByPin(pin: string) {
-    if (!pin) return;
+  public async connectByPin(pin: string): Promise<Peer | null> {
+    if (!pin) return null;
     const cleanPin = pin.trim();
-    if (cleanPin === this.selfPeer.pin) return;
+    if (cleanPin === this.selfPeer.pin) return null;
 
-    this.sendSignalingMessage({ pin: cleanPin }, {
-      type: 'CONNECT_REQUEST',
-    });
-  }
+    // 1. Check local in-memory peers first
+    let target: Peer | null = Array.from(this.peers.values()).find((p) => p.pin === cleanPin) || null;
 
-  public async sendFilesToPin(files: File[], pin: string): Promise<void> {
-    if (!pin || files.length === 0) return;
-    const cleanPin = pin.trim();
-
-    // Check if peer is already in local list
-    let target = Array.from(this.peers.values()).find((p) => p.pin === cleanPin);
-
+    // 2. Query local server signaling registry
     if (!target) {
-      // Query server for peer by PIN
       try {
         const res = await fetch(`/api/signal/peer-by-pin?pin=${encodeURIComponent(cleanPin)}`);
         if (res.ok) {
           const data = await res.json();
           if (data && data.peer) {
-            target = {
+            const peerObj: Peer = {
               ...data.peer,
               status: 'available',
               connectionType: 'webrtc-direct',
             };
-            this.peers.set(target!.id, target!);
+            target = peerObj;
+            this.peers.set(peerObj.id, peerObj);
+            this.peerHeartbeats.set(peerObj.id, Date.now());
+            this.broadcastPeersList();
+          }
+        }
+      } catch (err) {
+        console.warn('Failed to query peer by PIN:', err);
+      }
+    }
+
+    // 3. Send PIN_CONNECT_REQUEST to notify receiver and request bidirectional handshake
+    this.sendSignalingMessage({ pin: cleanPin }, {
+      type: 'PIN_CONNECT_REQUEST',
+      targetPin: cleanPin,
+      sender: this.selfPeer,
+    });
+
+    // 4. If target was not found in step 1 or 2, wait for PIN_CONNECT_ACK handshake
+    if (!target) {
+      target = await new Promise<Peer | null>((resolve) => {
+        let timer: any = null;
+        const waiter = (peer: Peer) => {
+          if (peer.pin === cleanPin) {
+            clearTimeout(timer);
+            resolve(peer);
+          }
+        };
+
+        const list = this.pinWaiters.get(cleanPin) || [];
+        list.push(waiter);
+        this.pinWaiters.set(cleanPin, list);
+
+        timer = setTimeout(() => {
+          const existingWaiters = this.pinWaiters.get(cleanPin) || [];
+          this.pinWaiters.set(cleanPin, existingWaiters.filter((w) => w !== waiter));
+          const found = Array.from(this.peers.values()).find((p) => p.pin === cleanPin);
+          resolve(found || null);
+        }, 1600);
+      });
+    }
+
+    if (target) {
+      target.status = 'connected';
+      this.peers.set(target.id, target);
+      this.peerHeartbeats.set(target.id, Date.now());
+      this.broadcastPeersList();
+      this.callbacks.onPeerConnectedByPin?.(target);
+
+      // Proactively establish WebRTC DataChannel connection
+      this.initiateWebRTCConnection(target.id, true).catch(() => {});
+      return target;
+    }
+
+    return null;
+  }
+
+  public async sendFilesToPin(files: File[], pin: string): Promise<{ success: boolean; peer?: Peer; error?: string }> {
+    if (!pin || files.length === 0) return { success: false, error: 'No files or PIN provided' };
+    const cleanPin = pin.trim();
+
+    // 1. Establish connection and resolve the real remote peer
+    let target: Peer | null = await this.connectByPin(cleanPin);
+
+    if (!target) {
+      // Retry once after brief delay
+      await new Promise((r) => setTimeout(r, 400));
+      target = await this.connectByPin(cleanPin);
+    }
+
+    if (!target) {
+      // Check server registry once more
+      try {
+        const res = await fetch(`/api/signal/peer-by-pin?pin=${encodeURIComponent(cleanPin)}`);
+        if (res.ok) {
+          const data = await res.json();
+          if (data && data.peer) {
+            const peerObj: Peer = {
+              ...data.peer,
+              status: 'available',
+              connectionType: 'webrtc-direct',
+            };
+            target = peerObj;
+            this.peers.set(peerObj.id, peerObj);
             this.broadcastPeersList();
           }
         }
@@ -826,6 +941,7 @@ export class WebRTCManager {
     }
 
     if (!target) {
+      // Fallback target with pin so relay stream will route directly to targetPin
       target = {
         id: `peer_pin_${cleanPin}`,
         pin: cleanPin,
@@ -840,11 +956,14 @@ export class WebRTCManager {
       this.broadcastPeersList();
     }
 
-    this.connectByPin(cleanPin);
+    const resolvedPeer: Peer = target;
 
+    // Send each file to the resolved target peer
     for (const file of files) {
-      await this.sendFile(file, target);
+      await this.sendFile(file, resolvedPeer);
     }
+
+    return { success: true, peer: resolvedPeer };
   }
 
   private ensureDataChannelConnected(targetPeerId: string): Promise<RTCDataChannel> {
@@ -975,9 +1094,10 @@ export class WebRTCManager {
       }
     };
 
+    const remotePeer = this.peers.get(targetPeerId);
     pc.onicecandidate = (event) => {
       if (event.candidate) {
-        this.sendSignalingMessage({ peerId: targetPeerId }, {
+        this.sendSignalingMessage({ peerId: targetPeerId, pin: remotePeer?.pin }, {
           type: 'ICE_CANDIDATE',
           candidate: event.candidate,
           isHost: event.candidate.candidate?.includes('typ host'),
@@ -1013,7 +1133,7 @@ export class WebRTCManager {
       const desc = new RTCSessionDescription({ type: offer.type, sdp: uncappedOfferSdp });
       await pc.setLocalDescription(desc);
 
-      this.sendSignalingMessage({ peerId: targetPeerId }, {
+      this.sendSignalingMessage({ peerId: targetPeerId, pin: remotePeer?.pin }, {
         type: 'OFFER',
         sdp: desc,
       });
@@ -1055,9 +1175,10 @@ export class WebRTCManager {
       }
     };
 
+    const remoteSender = this.peers.get(senderId);
     pc.onicecandidate = (event) => {
       if (event.candidate) {
-        this.sendSignalingMessage({ peerId: senderId }, {
+        this.sendSignalingMessage({ peerId: senderId, pin: remoteSender?.pin }, {
           type: 'ICE_CANDIDATE',
           candidate: event.candidate,
           isHost: event.candidate.candidate?.includes('typ host'),
@@ -1080,7 +1201,7 @@ export class WebRTCManager {
     const answerDesc = new RTCSessionDescription({ type: answer.type, sdp: uncappedAnswerSdp });
     await pc.setLocalDescription(answerDesc);
 
-    this.sendSignalingMessage({ peerId: senderId }, {
+    this.sendSignalingMessage({ peerId: senderId, pin: remoteSender?.pin }, {
       type: 'ANSWER',
       sdp: answerDesc,
     });
@@ -1496,6 +1617,7 @@ export class WebRTCManager {
           this.wsClient.send(JSON.stringify({
             type: 'WS_RELAY_CHUNK',
             targetId: targetPeer.id,
+            targetPin: targetPeer.pin,
             transferId: task.id,
             chunkIdx: idx,
             data: btoa(binaryStr),

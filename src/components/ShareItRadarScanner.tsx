@@ -10,6 +10,7 @@ import {
   Tablet,
   Radio,
   Zap,
+  Loader2,
 } from 'lucide-react';
 import { Peer } from '../types/transfer';
 import { formatBytes } from '../utils/formatters';
@@ -22,7 +23,7 @@ interface ShareItRadarScannerProps {
   onSelectReceiver: (peer: Peer) => void;
   onOpenScanner: () => void;
   onRefresh: () => void;
-  onConnectByPin: (pin: string) => void;
+  onConnectByPin: (pin: string) => void | Promise<any>;
   signalingStatus: 'connected' | 'connecting' | 'offline';
   signalingMessage?: string;
   isTetherMode?: boolean;
@@ -44,6 +45,7 @@ export const ShareItRadarScanner: React.FC<ShareItRadarScannerProps> = ({
   const [pinInput, setPinInput] = useState('');
   const [pinNotice, setPinNotice] = useState<string | null>(null);
   const [isRefreshing, setIsRefreshing] = useState(false);
+  const [isPinSubmitting, setIsPinSubmitting] = useState(false);
 
   const totalSize = stagedFiles.reduce((acc, f) => acc + f.size, 0);
 
@@ -53,7 +55,7 @@ export const ShareItRadarScanner: React.FC<ShareItRadarScannerProps> = ({
     setTimeout(() => setIsRefreshing(false), 800);
   };
 
-  const handlePinSubmit = (e: React.FormEvent) => {
+  const handlePinSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     const clean = pinInput.trim();
     if (!clean) return;
@@ -66,8 +68,15 @@ export const ShareItRadarScanner: React.FC<ShareItRadarScannerProps> = ({
       onSelectReceiver(matched);
       return;
     }
-    onConnectByPin(clean);
+    setIsPinSubmitting(true);
     setPinNotice(`Connecting and transmitting ${stagedFiles.length} file(s) to PIN ${clean}...`);
+    try {
+      await onConnectByPin(clean);
+    } catch {
+      setPinNotice(`Unable to connect to PIN ${clean}. Please verify the receiver is in Receive mode.`);
+    } finally {
+      setIsPinSubmitting(false);
+    }
   };
 
   const getDeviceIcon = (type: string) => {
@@ -142,10 +151,20 @@ export const ShareItRadarScanner: React.FC<ShareItRadarScannerProps> = ({
           />
           <button
             type="submit"
-            className="px-3 py-1 bg-cyan-600 hover:bg-cyan-500 text-white rounded-lg font-semibold transition-colors flex items-center gap-1"
+            disabled={isPinSubmitting || !pinInput.trim()}
+            className="px-3 py-1 bg-cyan-600 hover:bg-cyan-500 disabled:bg-neutral-300 dark:disabled:bg-neutral-700 text-white rounded-lg font-semibold transition-colors flex items-center gap-1 cursor-pointer disabled:cursor-not-allowed"
           >
-            <span>Send to PIN</span>
-            <ArrowRight className="w-3.5 h-3.5" />
+            {isPinSubmitting ? (
+              <>
+                <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                <span>Connecting...</span>
+              </>
+            ) : (
+              <>
+                <span>Send to PIN</span>
+                <ArrowRight className="w-3.5 h-3.5" />
+              </>
+            )}
           </button>
         </form>
       </div>

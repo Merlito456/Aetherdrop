@@ -12,6 +12,7 @@ import {
   KeyRound,
   Camera,
   ArrowRight,
+  Loader2,
 } from 'lucide-react';
 import { Peer } from '../types/transfer';
 
@@ -49,6 +50,7 @@ export const NearbyRadar: React.FC<NearbyRadarProps> = ({
   const [isRefreshing, setIsRefreshing] = useState(false);
   const [pinInput, setPinInput] = useState('');
   const [pinNotice, setPinNotice] = useState<string | null>(null);
+  const [isSubmittingPin, setIsSubmittingPin] = useState(false);
 
   const handleRefreshClick = () => {
     setIsRefreshing(true);
@@ -56,7 +58,7 @@ export const NearbyRadar: React.FC<NearbyRadarProps> = ({
     setTimeout(() => setIsRefreshing(false), 800);
   };
 
-  const handlePinSubmit = (e: React.FormEvent) => {
+  const handlePinSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     const clean = pinInput.trim();
     if (!clean) return;
@@ -64,10 +66,19 @@ export const NearbyRadar: React.FC<NearbyRadarProps> = ({
       setPinNotice("That is this device's own PIN. Enter the PIN shown on the other device.");
       return;
     }
-    onConnectByPin(clean);
+    setIsSubmittingPin(true);
     setPinNotice(`Connecting to device with PIN ${clean}...`);
-    setPinInput('');
-    setTimeout(() => setPinNotice(null), 4000);
+    try {
+      await onConnectByPin(clean);
+      setPinInput('');
+      setPinNotice(`Paired with PIN ${clean}!`);
+      setTimeout(() => setPinNotice(null), 3000);
+    } catch {
+      setPinNotice(`Unable to locate PIN ${clean}. Ensure the device is nearby and active.`);
+      setTimeout(() => setPinNotice(null), 4000);
+    } finally {
+      setIsSubmittingPin(false);
+    }
   };
 
   const getDeviceIcon = (type: string) => {
@@ -178,10 +189,20 @@ export const NearbyRadar: React.FC<NearbyRadarProps> = ({
           />
           <button
             type="submit"
-            className="px-3 py-1 bg-cyan-600 hover:bg-cyan-500 text-white rounded-lg font-semibold transition-colors flex items-center gap-1 shadow-2xs"
+            disabled={isSubmittingPin || !pinInput.trim()}
+            className="px-3 py-1 bg-cyan-600 hover:bg-cyan-500 disabled:bg-neutral-300 dark:disabled:bg-neutral-700 text-white rounded-lg font-semibold transition-colors flex items-center gap-1 shadow-2xs cursor-pointer disabled:cursor-not-allowed"
           >
-            <span>Connect</span>
-            <ArrowRight className="w-3.5 h-3.5" />
+            {isSubmittingPin ? (
+              <>
+                <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                <span>Connecting...</span>
+              </>
+            ) : (
+              <>
+                <span>Connect</span>
+                <ArrowRight className="w-3.5 h-3.5" />
+              </>
+            )}
           </button>
         </form>
       </div>

@@ -20,7 +20,8 @@ import { QRScannerModal } from './components/QRScannerModal';
 import { SecurityModal } from './components/SecurityModal';
 import { RoomModal } from './components/RoomModal';
 import { SpeedOptimizerModal } from './components/SpeedOptimizerModal';
-import { Lock, ArrowDownLeft, X } from 'lucide-react';
+import { PinModal } from './components/PinModal';
+import { Lock, ArrowDownLeft, X, CheckCircle2 } from 'lucide-react';
 
 type ShareItView =
   | 'home'
@@ -119,10 +120,12 @@ export default function App() {
   const [isSecurityModalOpen, setIsSecurityModalOpen] = useState(false);
   const [isRoomModalOpen, setIsRoomModalOpen] = useState(false);
   const [isSpeedModalOpen, setIsSpeedModalOpen] = useState(false);
+  const [isPinModalOpen, setIsPinModalOpen] = useState(false);
   const [notificationStatus, setNotificationStatus] = useState<NotificationPermission | 'unsupported'>('default');
 
-  // Real-time incoming transfer alert banner
+  // Real-time incoming transfer alert banner & pairing notice
   const [incomingAlert, setIncomingAlert] = useState<TransferTask | null>(null);
+  const [pairingNotice, setPairingNotice] = useState<{ peerName: string; peerPin: string; deviceType: string } | null>(null);
 
   // Signaling status
   const [signalingStatus, setSignalingStatus] = useState<'connected' | 'connecting' | 'offline'>('connecting');
@@ -202,6 +205,15 @@ export default function App() {
         setSignalingStatus(status);
         if (msg) setSignalingMessage(msg);
       },
+      onPeerConnectedByPin: (peer) => {
+        setSelectedPeerId(peer.id);
+        setPairingNotice({
+          peerName: peer.name,
+          peerPin: peer.pin,
+          deviceType: peer.deviceType,
+        });
+        setTimeout(() => setPairingNotice(null), 4500);
+      },
     }, encryptionMode, isTetherMode, speedProfile);
 
     managerRef.current = manager;
@@ -260,13 +272,41 @@ export default function App() {
   };
 
   // Direct connect or transmit staged files by PIN
-  const handleConnectByPin = async (pin: string) => {
-    if (!pin) return;
+  const handleConnectByPin = async (pin: string): Promise<{ success: boolean; peer?: Peer; error?: string }> => {
+    if (!pin) return { success: false, error: 'Please enter a 4-digit PIN' };
+    const clean = pin.trim();
+    if (clean === selfPeer.pin) {
+      return { success: false, error: "That is this device's own PIN. Enter the PIN shown on the receiver device." };
+    }
+
     if (stagedFilesToSend.length > 0) {
       setCurrentView('session');
-      await managerRef.current?.sendFilesToPin(stagedFilesToSend, pin);
+      const res = await managerRef.current?.sendFilesToPin(stagedFilesToSend, clean);
+      if (res?.peer) {
+        setSelectedPeerId(res.peer.id);
+      }
+      return { success: res?.success ?? true, peer: res?.peer, error: res?.error };
     } else {
-      managerRef.current?.connectByPin(pin);
+      const peer = await managerRef.current?.connectByPin(clean);
+      if (peer) {
+        setSelectedPeerId(peer.id);
+        setPairingNotice({
+          peerName: peer.name,
+          peerPin: peer.pin,
+          deviceType: peer.deviceType,
+        });
+        setTimeout(() => setPairingNotice(null), 4500);
+
+        // If user was scanning on radar, transition them to file selection with this peer paired!
+        if (currentView === 'send-radar' || currentView === 'radar-all') {
+          setCurrentView('send-select');
+        }
+        return { success: true, peer };
+      }
+      return {
+        success: false,
+        error: `Device with PIN ${clean} not found. Ensure the receiver is in Receive mode or has the app open.`,
+      };
     }
   };
 
@@ -357,11 +397,34 @@ export default function App() {
         onOpenRooms={() => setIsRoomModalOpen(true)}
         onOpenSecurity={() => setIsSecurityModalOpen(true)}
         onOpenSpeedOptimizer={() => setIsSpeedModalOpen(true)}
+        onOpenPinModal={() => setIsPinModalOpen(true)}
         speedProfile={speedProfile}
         notificationStatus={notificationStatus}
         onRequestNotification={handleRequestNotification}
         selfPeer={selfPeer}
       />
+
+      {/* Live Paired Toast */}
+      {pairingNotice && (
+        <div className="fixed top-20 right-4 z-50 max-w-sm w-full bg-emerald-600 text-white rounded-2xl p-4 shadow-xl shadow-emerald-600/25 flex items-center justify-between gap-3 animate-in slide-in-from-top-4 duration-200">
+          <div className="flex items-center gap-2.5">
+            <div className="w-9 h-9 rounded-xl bg-white/20 flex items-center justify-center font-bold text-white shrink-0">
+              <CheckCircle2 className="w-5 h-5 text-white" />
+            </div>
+            <div>
+              <p className="text-xs font-bold">Paired with {pairingNotice.peerName}!</p>
+              <p className="text-[11px] text-emerald-100 font-mono">PIN: {pairingNotice.peerPin} · {pairingNotice.deviceType}</p>
+            </div>
+          </div>
+          <button
+            onClick={() => setPairingNotice(null)}
+            className="p-1 hover:bg-white/20 rounded-lg text-white/80 hover:text-white cursor-pointer"
+            aria-label="Dismiss pairing notice"
+          >
+            <X className="w-4 h-4" />
+          </button>
+        </div>
+      )}
 
       {/* Floating Incoming Toast */}
       {incomingAlert && currentView !== 'session' && (
@@ -427,6 +490,7 @@ export default function App() {
             onTestTetherTransfer={handleTestTetherTransfer}
             speedProfile={speedProfile}
             onOpenSpeedOptimizer={() => setIsSpeedModalOpen(true)}
+            onOpenPinModal={() => setIsPinModalOpen(true)}
           />
         )}
 
@@ -460,6 +524,8 @@ export default function App() {
           <ShareItReceiveMode
             selfPeer={selfPeer}
             roomId={roomId}
+            peers={peers}
+            onOpenSession={() => setCurrentView('session')}
             onBack={() => setCurrentView('home')}
             signalingStatus={signalingStatus}
           />
@@ -644,6 +710,22 @@ export default function App() {
         }}
         isTetherMode={isTetherMode}
         onSwitchTetherMode={handleToggleTetherMode}
+      />
+
+      <PinModal
+        isOpen={isPinModalOpen}
+        onClose={() => setIsPinModalOpen(false)}
+        selfPeer={selfPeer}
+        stagedFilesCount={stagedFilesToSend.length}
+        onConnectByPin={handleConnectByPin}
+        onSuccess={(peer) => {
+          setSelectedPeerId(peer.id);
+          if (stagedFilesToSend.length > 0) {
+            setCurrentView('session');
+          } else {
+            setCurrentView('send-select');
+          }
+        }}
       />
     </div>
   );

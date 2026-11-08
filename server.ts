@@ -111,10 +111,11 @@ function routeSignalMessage(msg: SignalMessage, targetId?: string, targetPin?: s
     }
   }
 
-  // 2. Direct delivery by targetPin if specified
+  // 2. Direct delivery by targetPin if specified (across all rooms)
   if (targetPin) {
+    const cleanPin = String(targetPin).trim();
     for (const [id, peer] of peers.entries()) {
-      if (peer.pin === targetPin && id !== msg.senderId) {
+      if (peer.pin === cleanPin && id !== msg.senderId) {
         if (!messageQueues.has(id)) messageQueues.set(id, []);
         messageQueues.get(id)!.push(msg);
         sendToPeer(id, msg);
@@ -123,9 +124,8 @@ function routeSignalMessage(msg: SignalMessage, targetId?: string, targetPin?: s
     }
   }
 
-  // 3. Room broadcast (or fallback if direct targeting did not reach any peer)
-  // In a local Wi-Fi / tether environment, this guarantees the receiver is ALWAYS notified!
-  if (targetId === 'room' || !targetId || deliveredPeerIds.size === 0) {
+  // 3. Room broadcast if explicitly addressed to room or untargeted
+  if (targetId === 'room' || (!targetId && !targetPin) || (targetId === 'room' && deliveredPeerIds.size === 0)) {
     for (const [id, peer] of peers.entries()) {
       if (peer.roomId === currentRoom && id !== msg.senderId && !deliveredPeerIds.has(id)) {
         if (!messageQueues.has(id)) messageQueues.set(id, []);
@@ -188,10 +188,36 @@ wss.on('connection', (ws) => {
           routeSignalMessage(msg, targetId, targetPin, roomId);
         }
       } else if (parsed.type === 'WS_RELAY_CHUNK') {
-        // Fast-path WebSocket binary chunk relay: route directly to target peer socket
-        const { targetId, transferId, chunkIdx, data } = parsed;
-        if (targetId && data) {
-          const targetWs = peerSockets.get(targetId);
+        // Fast-path WebSocket binary chunk relay: route directly to target peer socket or by targetPin
+        const { targetId, targetPin, transferId, chunkIdx, data } = parsed;
+        if (data) {
+          let targetWs = targetId && targetId !== 'room' ? peerSockets.get(targetId) : undefined;
+          
+          // Fallback: look up socket by targetPin
+          if (!targetWs && targetPin) {
+            const cleanPin = String(targetPin).trim();
+            for (const [id, peer] of peers.entries()) {
+              if (peer.pin === cleanPin && id !== clientPeerId) {
+                targetWs = peerSockets.get(id);
+                if (targetWs) break;
+              }
+            }
+          }
+
+          // Fallback: lookup from relayTransfers
+          if (!targetWs && transferId && relayTransfers.has(transferId)) {
+            const relay = relayTransfers.get(transferId)!;
+            if (relay.targetId) targetWs = peerSockets.get(relay.targetId);
+            if (!targetWs && relay.targetPin) {
+              for (const [id, peer] of peers.entries()) {
+                if (peer.pin === relay.targetPin && id !== relay.senderId) {
+                  targetWs = peerSockets.get(id);
+                  if (targetWs) break;
+                }
+              }
+            }
+          }
+
           if (targetWs && targetWs.readyState === WebSocket.OPEN) {
             try {
               targetWs.send(JSON.stringify({
@@ -228,22 +254,19 @@ wss.on('connection', (ws) => {
   });
 });
 
-// Prune inactive peers & expired relay transfers
+// Prune inactive peers & expired relay transfers (generous 90s window for mobile screen sleep)
 setInterval(() => {
   const now = Date.now();
   for (const [id, peer] of peers.entries()) {
-    if (now - peer.lastSeen > 25000) {
+    const isSocketOpen = peerSockets.has(id) && peerSockets.get(id)?.readyState === WebSocket.OPEN;
+    if (!isSocketOpen && now - peer.lastSeen > 90000) {
       peers.delete(id);
       messageQueues.delete(id);
-      const ws = peerSockets.get(id);
-      if (ws) {
-        try { ws.close(); } catch {}
-        peerSockets.delete(id);
-      }
+      peerSockets.delete(id);
     }
   }
   for (const [xferId, xfer] of relayTransfers.entries()) {
-    if (now - xfer.lastActive > 45000) {
+    if (now - xfer.lastActive > 90000) {
       relayTransfers.delete(xferId);
     }
   }
@@ -349,7 +372,7 @@ app.post('/api/signal/leave', (req, res) => {
   res.json({ ok: true });
 });
 
-// Direct Peer lookup by PIN
+// Direct Peer lookup by PIN (Works across all rooms with active socket or recent heartbeat)
 app.get('/api/signal/peer-by-pin', (req, res) => {
   const pin = req.query.pin as string;
   if (!pin) {
@@ -358,21 +381,36 @@ app.get('/api/signal/peer-by-pin', (req, res) => {
   }
   const cleanPin = pin.trim();
   const now = Date.now();
+  let candidate: PeerInfo | null = null;
+
   for (const peer of peers.values()) {
-    if (peer.pin === cleanPin && now - peer.lastSeen < 25000) {
+    if (peer.pin === cleanPin) {
+      if (!candidate || peer.lastSeen > candidate.lastSeen) {
+        candidate = peer;
+      }
+    }
+  }
+
+  // Found if active socket exists OR seen within last 90 seconds
+  if (candidate) {
+    const isSocketOpen = peerSockets.has(candidate.id) && peerSockets.get(candidate.id)?.readyState === WebSocket.OPEN;
+    if (isSocketOpen || (now - candidate.lastSeen < 90000)) {
+      candidate.lastSeen = now;
       res.json({
         peer: {
-          id: peer.id,
-          pin: peer.pin,
-          name: peer.name,
-          deviceType: peer.deviceType,
-          browser: peer.browser,
-          avatarColor: peer.avatarColor,
+          id: candidate.id,
+          pin: candidate.pin,
+          name: candidate.name,
+          deviceType: candidate.deviceType,
+          browser: candidate.browser,
+          avatarColor: candidate.avatarColor,
+          roomId: candidate.roomId,
         },
       });
       return;
     }
   }
+
   res.status(404).json({ error: 'Peer with PIN not found' });
 });
 

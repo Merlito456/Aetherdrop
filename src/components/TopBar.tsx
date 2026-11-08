@@ -11,6 +11,7 @@ import {
   Share2,
   Gauge,
   Zap,
+  KeyRound,
 } from 'lucide-react';
 import { Peer, SpeedProfile } from '../types/transfer';
 
@@ -24,6 +25,7 @@ interface TopBarProps {
   onOpenRooms: () => void;
   onOpenSecurity: () => void;
   onOpenSpeedOptimizer?: () => void;
+  onOpenPinModal?: () => void;
   speedProfile?: SpeedProfile;
   notificationStatus: NotificationPermission | 'unsupported';
   onRequestNotification: () => void;
@@ -40,6 +42,7 @@ export const TopBar: React.FC<TopBarProps> = ({
   onOpenRooms,
   onOpenSecurity,
   onOpenSpeedOptimizer,
+  onOpenPinModal,
   speedProfile = 'turbo-8x',
   notificationStatus,
   onRequestNotification,
@@ -154,11 +157,23 @@ export const TopBar: React.FC<TopBarProps> = ({
             </button>
           )}
 
+          {/* PIN Quick Pair Button */}
+          {onOpenPinModal && (
+            <button
+              onClick={onOpenPinModal}
+              title="Connect via 4-digit PIN"
+              className="p-2 text-neutral-600 dark:text-neutral-300 hover:text-cyan-600 dark:hover:text-cyan-400 rounded-lg hover:bg-neutral-100 dark:hover:bg-neutral-800 transition-colors cursor-pointer"
+              aria-label="Connect via PIN"
+            >
+              <KeyRound className="w-4 h-4" />
+            </button>
+          )}
+
           {/* QR Code Quick Pair Button */}
           <button
             onClick={onOpenQR}
             title="Scan QR Code to connect mobile device"
-            className="p-2 text-neutral-600 dark:text-neutral-300 hover:text-neutral-900 dark:hover:text-white rounded-lg hover:bg-neutral-100 dark:hover:bg-neutral-800 transition-colors"
+            className="p-2 text-neutral-600 dark:text-neutral-300 hover:text-neutral-900 dark:hover:text-white rounded-lg hover:bg-neutral-100 dark:hover:bg-neutral-800 transition-colors cursor-pointer"
             aria-label="Show QR Code"
           >
             <QrCode className="w-4 h-4" />
