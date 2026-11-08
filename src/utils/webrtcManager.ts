@@ -11,9 +11,9 @@ import {
 import { playSuccessChime, playStartTone, playErrorTone } from './audio';
 import { sendTransferNotification } from './notifications';
 import { formatBytes } from './formatters';
+import { joinRoom as joinNostrRoom } from '@trystero-p2p/nostr';
 
-const CHUNK_SIZE = 64 * 1024; // 64 KB per chunk for optimal WebRTC throughput
-const MAX_BUFFERED_AMOUNT = 512 * 1024; // 512 KB backpressure ceiling
+const CHUNK_SIZE = 64 * 1024; // 64 KB chunks for optimal WebRTC throughput
 
 export interface WebRTCManagerCallbacks {
   onPeersUpdated: (peers: Peer[]) => void;
@@ -28,21 +28,31 @@ export interface WebRTCManagerCallbacks {
     peerName: string;
     fingerprint?: string;
   }) => void;
+  onStatusChange?: (status: { connectedRelays: number; mode: string }) => void;
 }
 
 export class WebRTCManager {
   private selfPeer: Peer;
   private roomId: string;
-  private peerConnections = new Map<string, RTCPeerConnection>();
-  private dataChannels = new Map<string, RTCDataChannel>();
+  private callbacks: WebRTCManagerCallbacks;
+
+  // Trystero P2P Room instance & actions
+  private room: any = null;
+  private presenceAction: any = null;
+  private fileOfferAction: any = null;
+  private fileChunkAction: any = null;
+  private fileControlAction: any = null;
+  private fileCompleteAction: any = null;
+
+  // Active state
+  private peers = new Map<string, Peer>();
   private activeTransfers = new Map<string, TransferTask>();
   private pausedTransfers = new Set<string>();
   private cancelledTransfers = new Set<string>();
-  private callbacks: WebRTCManagerCallbacks;
-  private pollInterval: any = null;
-  private heartbeatInterval: any = null;
-  private simulatedPeerActive: boolean = false;
   private speedTrackers = new Map<string, { lastBytes: number; lastTime: number }>();
+  private simulatedPeerActive: boolean = false;
+  private presenceInterval: any = null;
+  private localPollInterval: any = null;
 
   constructor(selfPeer: Peer, roomId: string, callbacks: WebRTCManagerCallbacks) {
     this.selfPeer = selfPeer;
@@ -51,255 +61,264 @@ export class WebRTCManager {
   }
 
   public init() {
-    this.registerSelf();
-    this.startHeartbeat();
-    this.startMessagePolling();
-    this.fetchPeers();
+    this.joinMeshRoom();
+    this.startLocalSignalingFallback();
   }
 
   public destroy() {
-    if (this.pollInterval) clearInterval(this.pollInterval);
-    if (this.heartbeatInterval) clearInterval(this.heartbeatInterval);
-    for (const dc of this.dataChannels.values()) {
-      try { dc.close(); } catch { }
+    if (this.presenceInterval) clearInterval(this.presenceInterval);
+    if (this.localPollInterval) clearInterval(this.localPollInterval);
+    if (this.room) {
+      try {
+        this.room.leave();
+      } catch {}
+      this.room = null;
     }
-    for (const pc of this.peerConnections.values()) {
-      try { pc.close(); } catch { }
-    }
-    this.leaveRoom();
   }
 
   public setRoomId(newRoom: string) {
+    if (this.roomId === newRoom && this.room) return;
     this.roomId = newRoom;
-    this.registerSelf();
-    this.fetchPeers();
+    if (this.room) {
+      try {
+        this.room.leave();
+      } catch {}
+      this.room = null;
+    }
+    this.peers.clear();
+    this.broadcastPeersList();
+    this.joinMeshRoom();
   }
 
-  private async registerSelf() {
+  // Connects to global decentralized WebRTC discovery mesh
+  private joinMeshRoom() {
     try {
-      await fetch('/api/signal/register', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
+      const sanitizedRoom = (this.roomId || 'default-lan').toLowerCase().replace(/[^a-z0-9_-]/g, '-');
+      const room = joinNostrRoom(
+        { appId: 'aetherdrop-p2p-transfer-v1' },
+        `aetherdrop-${sanitizedRoom}`
+      );
+      this.room = room;
+
+      // 1. Setup Presence Action
+      this.presenceAction = room.makeAction('presence');
+      this.presenceAction.onReceive = (data: any, peerId: string) => {
+        if (!data || !data.peer) return;
+        const incomingPeer: Peer = {
+          ...data.peer,
+          id: peerId, // Map to trystero peer identifier
+          status: 'connected',
+          connectionType: 'webrtc-direct',
+        };
+        this.peers.set(peerId, incomingPeer);
+        this.broadcastPeersList();
+      };
+
+      // 2. Setup File Offer Action
+      this.fileOfferAction = room.makeAction('file-offer');
+      this.fileOfferAction.onReceive = async (msg: any, peerId: string) => {
+        if (!msg || !msg.transferId) return;
+        try {
+          const rawKeyBuffer = new Uint8Array(msg.rawKey).buffer;
+          const chunkKey = await importKeyRaw(rawKeyBuffer);
+          const senderPeer = this.peers.get(peerId);
+
+          const task: TransferTask = {
+            id: msg.transferId,
+            fileName: msg.fileName,
+            fileSize: msg.fileSize,
+            mimeType: msg.mimeType,
+            direction: 'receive',
+            peerId,
+            peerName: senderPeer ? senderPeer.name : 'Nearby Peer',
+            bytesTransferred: 0,
+            progress: 0,
+            speed: 0,
+            eta: 0,
+            status: 'transferring',
+            startedAt: Date.now(),
+            updatedAt: Date.now(),
+            isEncrypted: true,
+            fingerprint: msg.fingerprint,
+            chunkKey,
+            totalChunks: msg.totalChunks,
+            receivedChunks: [],
+          };
+
+          this.activeTransfers.set(task.id, task);
+          this.speedTrackers.set(task.id, { lastBytes: 0, lastTime: Date.now() });
+          this.callbacks.onTransferUpdated(task);
+          playStartTone();
+        } catch (err) {
+          console.error('Failed to parse incoming file offer:', err);
+        }
+      };
+
+      // 3. Setup File Chunk Action (AES-256-GCM Encrypted Chunks)
+      this.fileChunkAction = room.makeAction('file-chunk');
+      this.fileChunkAction.onReceive = async (msg: any) => {
+        if (!msg || !msg.transferId) return;
+        const task = this.activeTransfers.get(msg.transferId);
+        if (!task || !task.chunkKey) return;
+
+        try {
+          const iv = new Uint8Array(msg.iv);
+          const encryptedBuffer = msg.data instanceof ArrayBuffer
+            ? msg.data
+            : new Uint8Array(msg.data).buffer;
+
+          const decrypted = await decryptChunk(task.chunkKey, encryptedBuffer, iv);
+          if (!task.receivedChunks) task.receivedChunks = [];
+          task.receivedChunks[msg.chunkIdx] = decrypted;
+          task.bytesTransferred += decrypted.byteLength;
+          task.progress = Math.min(100, Math.round((task.bytesTransferred / task.fileSize) * 100));
+
+          this.updateMetrics(task);
+          this.callbacks.onTransferUpdated(task);
+        } catch (err) {
+          console.error('Decryption failed for chunk:', err);
+          task.status = 'error';
+          task.errorReason = 'Cryptographic verification failed';
+          this.callbacks.onTransferUpdated(task);
+        }
+      };
+
+      // 4. Setup File Control Action (Pause / Resume / Cancel)
+      this.fileControlAction = room.makeAction('file-control');
+      this.fileControlAction.onReceive = (msg: any) => {
+        if (!msg || !msg.transferId) return;
+        const task = this.activeTransfers.get(msg.transferId);
+        if (!task) return;
+
+        if (msg.type === 'PAUSE') {
+          this.pausedTransfers.add(msg.transferId);
+          task.status = 'paused';
+          task.speed = 0;
+          this.callbacks.onTransferUpdated(task);
+        } else if (msg.type === 'RESUME') {
+          this.pausedTransfers.delete(msg.transferId);
+          task.status = 'transferring';
+          this.callbacks.onTransferUpdated(task);
+        } else if (msg.type === 'CANCEL') {
+          this.cancelledTransfers.add(msg.transferId);
+          task.status = 'cancelled';
+          task.speed = 0;
+          task.eta = 0;
+          if (task.receivedChunks) task.receivedChunks = [];
+          this.callbacks.onTransferUpdated(task);
+          playErrorTone();
+        }
+      };
+
+      // 5. Setup File Complete Action
+      this.fileCompleteAction = room.makeAction('file-complete');
+      this.fileCompleteAction.onReceive = (msg: any) => {
+        if (!msg || !msg.transferId) return;
+        const task = this.activeTransfers.get(msg.transferId);
+        if (task && task.receivedChunks) {
+          this.finalizeReceivedFile(task, msg.checksum);
+        }
+      };
+
+      // Event: Peer Joined room
+      room.onPeerJoin = (peerId: string) => {
+        console.log(`[AetherDrop] Peer joined room: ${peerId}`);
+        // Immediately announce self to this peer
+        this.sendPresenceInfo(peerId);
+      };
+
+      // Event: Peer Left room
+      room.onPeerLeave = (peerId: string) => {
+        console.log(`[AetherDrop] Peer left room: ${peerId}`);
+        this.peers.delete(peerId);
+        this.broadcastPeersList();
+      };
+
+      // Periodic presence broadcast every 3.5s
+      this.sendPresenceInfo();
+      this.presenceInterval = setInterval(() => {
+        this.sendPresenceInfo();
+      }, 3500);
+
+    } catch (err) {
+      console.warn('Failed to initialize mesh room:', err);
+    }
+  }
+
+  private sendPresenceInfo(targetPeerId?: string) {
+    if (!this.presenceAction) return;
+    try {
+      const payload = {
+        peer: {
           id: this.selfPeer.id,
           name: this.selfPeer.name,
           deviceType: this.selfPeer.deviceType,
           browser: this.selfPeer.browser,
           avatarColor: this.selfPeer.avatarColor,
-          roomId: this.roomId,
-        }),
-      });
-    } catch (err) {
-      console.warn('Signaling registration offline/skipped:', err);
-    }
+        },
+      };
+      if (targetPeerId) {
+        this.presenceAction.send(payload, targetPeerId);
+      } else {
+        this.presenceAction.send(payload);
+      }
+    } catch {}
   }
 
-  private startHeartbeat() {
-    this.heartbeatInterval = setInterval(async () => {
+  // Local Express server fallback (for localhost / LAN dev)
+  private startLocalSignalingFallback() {
+    this.localPollInterval = setInterval(async () => {
       try {
-        await fetch('/api/signal/heartbeat', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ id: this.selfPeer.id }),
-        });
-        this.fetchPeers();
-      } catch { }
+        const res = await fetch(`/api/signal/peers?roomId=${encodeURIComponent(this.roomId)}&excludeId=${encodeURIComponent(this.selfPeer.id)}`);
+        if (res.ok) {
+          const data = await res.json();
+          for (const sp of data.peers || []) {
+            if (!this.peers.has(sp.id)) {
+              this.peers.set(sp.id, {
+                ...sp,
+                status: 'available',
+                connectionType: 'webrtc-lan',
+              });
+            }
+          }
+          this.broadcastPeersList();
+        }
+      } catch {}
     }, 4000);
   }
 
-  private startMessagePolling() {
-    this.pollInterval = setInterval(async () => {
-      try {
-        const res = await fetch(`/api/signal/messages?peerId=${encodeURIComponent(this.selfPeer.id)}`);
-        if (res.ok) {
-          const data = await res.json();
-          for (const msg of data.messages || []) {
-            this.handleSignalMessage(msg);
-          }
-        }
-      } catch { }
-    }, 1500);
+  private broadcastPeersList() {
+    const list = Array.from(this.peers.values());
+    if (this.simulatedPeerActive) {
+      list.push({
+        id: 'simulated_peer_test',
+        name: 'Pixel 9 Pro (Simulated Wi-Fi Peer)',
+        deviceType: 'mobile',
+        browser: 'Chrome Mobile',
+        avatarColor: '#10b981',
+        status: 'connected',
+        connectionType: 'simulated',
+      });
+    }
+    this.callbacks.onPeersUpdated(list);
   }
 
-  public async fetchPeers() {
-    try {
-      const res = await fetch(`/api/signal/peers?roomId=${encodeURIComponent(this.roomId)}&excludeId=${encodeURIComponent(this.selfPeer.id)}`);
-      if (res.ok) {
-        const data = await res.json();
-        const serverPeers: Peer[] = (data.peers || []).map((p: any) => ({
-          ...p,
-          status: this.dataChannels.has(p.id) ? 'connected' : 'available',
-        }));
-
-        if (this.simulatedPeerActive) {
-          serverPeers.push({
-            id: 'simulated_peer_test',
-            name: 'Pixel 9 Pro (Simulated Wi-Fi Peer)',
-            deviceType: 'mobile',
-            browser: 'Chrome Mobile',
-            avatarColor: '#10b981',
-            status: 'connected',
-            connectionType: 'simulated',
-          });
-        }
-
-        this.callbacks.onPeersUpdated(serverPeers);
-      }
-    } catch {
-      if (this.simulatedPeerActive) {
-        this.callbacks.onPeersUpdated([{
-          id: 'simulated_peer_test',
-          name: 'Pixel 9 Pro (Simulated Wi-Fi Peer)',
-          deviceType: 'mobile',
-          browser: 'Chrome Mobile',
-          avatarColor: '#10b981',
-          status: 'connected',
-          connectionType: 'simulated',
-        }]);
-      }
-    }
+  public fetchPeers() {
+    this.sendPresenceInfo();
+    this.broadcastPeersList();
   }
 
   public toggleSimulatedPeer(enable: boolean) {
     this.simulatedPeerActive = enable;
-    this.fetchPeers();
+    this.broadcastPeersList();
   }
 
-  private async leaveRoom() {
-    try {
-      await fetch('/api/signal/leave', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ id: this.selfPeer.id }),
-      });
-    } catch { }
-  }
-
-  private async sendSignal(targetId: string, type: string, payload: any) {
-    try {
-      await fetch('/api/signal/send', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          senderId: this.selfPeer.id,
-          targetId,
-          type,
-          payload,
-        }),
-      });
-    } catch (err) {
-      console.warn('Failed to send signaling message:', err);
-    }
-  }
-
-  // Connect to a peer via WebRTC offer/answer
-  public async connectToPeer(targetPeerId: string): Promise<boolean> {
-    if (targetPeerId === 'simulated_peer_test') {
-      return true;
-    }
-
-    if (this.dataChannels.has(targetPeerId)) {
-      return true;
-    }
-
-    const pc = new RTCPeerConnection({
-      iceServers: [
-        { urls: 'stun:stun.l.google.com:19302' },
-        { urls: 'stun:global.stun.twilio.com:3478' },
-      ],
-    });
-    this.peerConnections.set(targetPeerId, pc);
-
-    const dc = pc.createDataChannel('aetherdrop_transfer', { ordered: true });
-    this.setupDataChannel(targetPeerId, dc);
-
-    pc.onicecandidate = (event) => {
-      if (event.candidate) {
-        this.sendSignal(targetPeerId, 'ice-candidate', event.candidate);
-      }
-    };
-
-    const offer = await pc.createOffer();
-    await pc.setLocalDescription(offer);
-    await this.sendSignal(targetPeerId, 'offer', offer);
-    return true;
-  }
-
-  private setupDataChannel(peerId: string, dc: RTCDataChannel) {
-    dc.binaryType = 'arraybuffer';
-    dc.bufferedAmountLowThreshold = 64 * 1024;
-
-    dc.onopen = () => {
-      this.dataChannels.set(peerId, dc);
-      this.fetchPeers();
-    };
-
-    dc.onclose = () => {
-      this.dataChannels.delete(peerId);
-      this.fetchPeers();
-    };
-
-    dc.onerror = (e) => {
-      console.error(`DataChannel error with peer ${peerId}:`, e);
-    };
-
-    dc.onmessage = (event) => {
-      this.handleDataChannelMessage(peerId, event.data);
-    };
-  }
-
-  private async handleSignalMessage(msg: { senderId: string; type: string; payload: any }) {
-    const { senderId, type, payload } = msg;
-
-    if (type === 'offer') {
-      let pc = this.peerConnections.get(senderId);
-      if (!pc) {
-        pc = new RTCPeerConnection({
-          iceServers: [
-            { urls: 'stun:stun.l.google.com:19302' },
-            { urls: 'stun:global.stun.twilio.com:3478' },
-          ],
-        });
-        this.peerConnections.set(senderId, pc);
-
-        pc.ondatachannel = (e) => {
-          this.setupDataChannel(senderId, e.channel);
-        };
-
-        pc.onicecandidate = (event) => {
-          if (event.candidate) {
-            this.sendSignal(senderId, 'ice-candidate', event.candidate);
-          }
-        };
-      }
-
-      await pc.setRemoteDescription(new RTCSessionDescription(payload));
-      const answer = await pc.createAnswer();
-      await pc.setLocalDescription(answer);
-      await this.sendSignal(senderId, 'answer', answer);
-    } else if (type === 'answer') {
-      const pc = this.peerConnections.get(senderId);
-      if (pc) {
-        await pc.setRemoteDescription(new RTCSessionDescription(payload));
-      }
-    } else if (type === 'ice-candidate') {
-      const pc = this.peerConnections.get(senderId);
-      if (pc && payload) {
-        try {
-          await pc.addIceCandidate(new RTCIceCandidate(payload));
-        } catch (err) {
-          console.warn('ICE candidate addition failed:', err);
-        }
-      }
-    }
-  }
-
-  // Send a file to a peer
+  // Send a file to a peer over WebRTC with AES-256-GCM encryption
   public async sendFile(file: File, targetPeer: Peer): Promise<string> {
     const transferId = 'xfer_' + Math.random().toString(36).slice(2, 10);
     const totalChunks = Math.ceil(file.size / CHUNK_SIZE);
 
-    // Generate ephemeral 256-bit AES-GCM key for this transfer
+    // Ephemeral 256-bit AES-GCM session key
     const key = await generateTransferKey();
     const rawKey = await exportKeyRaw(key);
     const fingerprint = await generateFingerprint(rawKey);
@@ -335,13 +354,8 @@ export class WebRTCManager {
       return transferId;
     }
 
-    // Ensure connection is established
-    await this.connectToPeer(targetPeer.id);
-    const dc = this.dataChannels.get(targetPeer.id);
-
-    // Send metadata header over control
-    const metaPayload = {
-      type: 'FILE_OFFER',
+    // Send file offer metadata
+    const offerPayload = {
       transferId,
       fileName: file.name,
       fileSize: file.size,
@@ -351,14 +365,11 @@ export class WebRTCManager {
       fingerprint,
     };
 
-    if (dc && dc.readyState === 'open') {
-      dc.send(JSON.stringify(metaPayload));
-    } else {
-      // Send via signaling as fallback
-      await this.sendSignal(targetPeer.id, 'file-offer', metaPayload);
+    if (this.fileOfferAction) {
+      await this.fileOfferAction.send(offerPayload, targetPeer.id);
     }
 
-    // Start streaming chunks
+    // Begin chunk streaming
     this.streamFileChunks(task, file, key, targetPeer.id);
     return transferId;
   }
@@ -380,7 +391,7 @@ export class WebRTCManager {
       if (this.cancelledTransfers.has(task.id)) {
         task.status = 'cancelled';
         this.callbacks.onTransferUpdated(task);
-        this.sendControlMessage(targetPeerId, 'TRANSFER_CANCEL', { transferId: task.id });
+        this.fileControlAction?.send({ type: 'CANCEL', transferId: task.id }, targetPeerId);
         return;
       }
 
@@ -388,7 +399,7 @@ export class WebRTCManager {
         task.status = 'paused';
         task.speed = 0;
         this.callbacks.onTransferUpdated(task);
-        await new Promise(r => setTimeout(r, 400));
+        await new Promise((r) => setTimeout(r, 400));
         if (this.cancelledTransfers.has(task.id)) return;
       }
 
@@ -401,33 +412,20 @@ export class WebRTCManager {
       const slice = file.slice(start, end);
       const buffer = await slice.arrayBuffer();
 
-      // Encrypt chunk using AES-GCM
+      // Encrypt chunk using AES-256-GCM
       const { encrypted, iv } = await encryptChunk(key, buffer, chunkIdx);
 
-      // Check DataChannel backpressure
-      const dc = this.dataChannels.get(targetPeerId);
-      if (dc && dc.readyState === 'open') {
-        if (dc.bufferedAmount > MAX_BUFFERED_AMOUNT) {
-          await new Promise<void>((resolve) => {
-            const onLow = () => {
-              dc.removeEventListener('bufferedamountlow', onLow);
-              resolve();
-            };
-            dc.addEventListener('bufferedamountlow', onLow);
-          });
-        }
-
-        // Send chunk message header + encrypted payload
-        const header = JSON.stringify({
-          type: 'CHUNK_HEADER',
-          transferId: task.id,
-          chunkIdx,
-          iv: Array.from(iv),
-          size: encrypted.byteLength,
-        });
-
-        dc.send(header);
-        dc.send(encrypted);
+      // Send chunk over WebRTC DataChannel
+      if (this.fileChunkAction) {
+        await this.fileChunkAction.send(
+          {
+            transferId: task.id,
+            chunkIdx,
+            iv: Array.from(iv),
+            data: encrypted,
+          },
+          targetPeerId
+        );
       }
 
       bytesSent += (end - start);
@@ -436,17 +434,27 @@ export class WebRTCManager {
 
       this.updateMetrics(task);
       this.callbacks.onTransferUpdated(task);
+
+      // Yield control slightly to maintain 60fps UI smoothness
+      if (chunkIdx % 4 === 0) {
+        await new Promise((r) => setTimeout(r, 4));
+      }
     }
 
-    // Compute entire file checksum for end-to-end verification
+    // Verify complete file checksum
     const fullBuffer = await file.arrayBuffer();
     const checksum = await computeSHA256(fullBuffer);
     task.checksum = checksum;
 
-    this.sendControlMessage(targetPeerId, 'FILE_COMPLETE', {
-      transferId: task.id,
-      checksum,
-    });
+    if (this.fileCompleteAction) {
+      await this.fileCompleteAction.send(
+        {
+          transferId: task.id,
+          checksum,
+        },
+        targetPeerId
+      );
+    }
 
     task.status = 'completed';
     task.completedAt = Date.now();
@@ -458,102 +466,6 @@ export class WebRTCManager {
     sendTransferNotification('File Sent Successfully', {
       body: `${task.fileName} (${formatBytes(task.fileSize)}) delivered to ${task.peerName}`,
     });
-  }
-
-  // Handle messages received over RTCDataChannel
-  private async handleDataChannelMessage(peerId: string, data: any) {
-    if (typeof data === 'string') {
-      try {
-        const msg = JSON.parse(data);
-        if (msg.type === 'FILE_OFFER') {
-          const rawKeyBuffer = new Uint8Array(msg.rawKey).buffer;
-          const chunkKey = await importKeyRaw(rawKeyBuffer);
-
-          const task: TransferTask = {
-            id: msg.transferId,
-            fileName: msg.fileName,
-            fileSize: msg.fileSize,
-            mimeType: msg.mimeType,
-            direction: 'receive',
-            peerId,
-            peerName: 'Remote Peer',
-            bytesTransferred: 0,
-            progress: 0,
-            speed: 0,
-            eta: 0,
-            status: 'transferring',
-            startedAt: Date.now(),
-            updatedAt: Date.now(),
-            isEncrypted: true,
-            fingerprint: msg.fingerprint,
-            chunkKey,
-            totalChunks: msg.totalChunks,
-            receivedChunks: [],
-          };
-
-          this.activeTransfers.set(task.id, task);
-          this.speedTrackers.set(task.id, { lastBytes: 0, lastTime: Date.now() });
-          this.callbacks.onTransferUpdated(task);
-          playStartTone();
-        } else if (msg.type === 'CHUNK_HEADER') {
-          // Store pending header for next binary data
-          (this as any).pendingChunkHeader = msg;
-        } else if (msg.type === 'TRANSFER_PAUSE') {
-          this.pausedTransfers.add(msg.transferId);
-          const task = this.activeTransfers.get(msg.transferId);
-          if (task) {
-            task.status = 'paused';
-            this.callbacks.onTransferUpdated(task);
-          }
-        } else if (msg.type === 'TRANSFER_RESUME') {
-          this.pausedTransfers.delete(msg.transferId);
-          const task = this.activeTransfers.get(msg.transferId);
-          if (task) {
-            task.status = 'transferring';
-            this.callbacks.onTransferUpdated(task);
-          }
-        } else if (msg.type === 'TRANSFER_CANCEL') {
-          this.cancelledTransfers.add(msg.transferId);
-          const task = this.activeTransfers.get(msg.transferId);
-          if (task) {
-            task.status = 'cancelled';
-            this.callbacks.onTransferUpdated(task);
-            playErrorTone();
-          }
-        } else if (msg.type === 'FILE_COMPLETE') {
-          const task = this.activeTransfers.get(msg.transferId);
-          if (task && task.receivedChunks) {
-            this.finalizeReceivedFile(task, msg.checksum);
-          }
-        }
-      } catch (err) {
-        console.warn('Error processing data channel text message:', err);
-      }
-    } else if (data instanceof ArrayBuffer) {
-      const header = (this as any).pendingChunkHeader;
-      if (header) {
-        const task = this.activeTransfers.get(header.transferId);
-        if (task && task.chunkKey) {
-          const iv = new Uint8Array(header.iv);
-          try {
-            const decrypted = await decryptChunk(task.chunkKey, data, iv);
-            if (!task.receivedChunks) task.receivedChunks = [];
-            task.receivedChunks[header.chunkIdx] = decrypted;
-            task.bytesTransferred += decrypted.byteLength;
-            task.progress = Math.min(100, Math.round((task.bytesTransferred / task.fileSize) * 100));
-
-            this.updateMetrics(task);
-            this.callbacks.onTransferUpdated(task);
-          } catch (err) {
-            console.error('Decryption failed for chunk:', err);
-            task.status = 'error';
-            task.errorReason = 'Cryptographic verification failed';
-            this.callbacks.onTransferUpdated(task);
-          }
-        }
-        (this as any).pendingChunkHeader = null;
-      }
-    }
   }
 
   private async finalizeReceivedFile(task: TransferTask, expectedChecksum?: string) {
@@ -573,7 +485,7 @@ export class WebRTCManager {
       return;
     }
 
-    // In-memory zero-caching URL (never persistent)
+    // Ephemeral download trigger (zero-caching)
     const downloadUrl = URL.createObjectURL(blob);
     task.downloadUrl = downloadUrl;
     task.status = 'completed';
@@ -582,7 +494,6 @@ export class WebRTCManager {
     task.speed = 0;
     task.eta = 0;
 
-    // Immediately trigger browser download for seamless local sharing
     const a = document.createElement('a');
     a.href = downloadUrl;
     a.download = task.fileName;
@@ -598,7 +509,6 @@ export class WebRTCManager {
     });
   }
 
-  // Update transfer speed and ETA calculation
   private updateMetrics(task: TransferTask) {
     const now = Date.now();
     const tracker = this.speedTrackers.get(task.id);
@@ -611,7 +521,6 @@ export class WebRTCManager {
     if (elapsed >= 0.5) {
       const bytesDiff = task.bytesTransferred - tracker.lastBytes;
       const currentSpeed = bytesDiff / elapsed;
-      // Exponential moving average for smooth display
       task.speed = task.speed === 0 ? currentSpeed : Math.round(task.speed * 0.4 + currentSpeed * 0.6);
 
       const remainingBytes = Math.max(0, task.fileSize - task.bytesTransferred);
@@ -630,7 +539,7 @@ export class WebRTCManager {
       task.status = 'paused';
       task.speed = 0;
       this.callbacks.onTransferUpdated(task);
-      this.sendControlMessage(task.peerId, 'TRANSFER_PAUSE', { transferId });
+      this.fileControlAction?.send({ type: 'PAUSE', transferId }, task.peerId);
     }
   }
 
@@ -640,7 +549,7 @@ export class WebRTCManager {
     if (task) {
       task.status = 'transferring';
       this.callbacks.onTransferUpdated(task);
-      this.sendControlMessage(task.peerId, 'TRANSFER_RESUME', { transferId });
+      this.fileControlAction?.send({ type: 'RESUME', transferId }, task.peerId);
     }
   }
 
@@ -651,30 +560,17 @@ export class WebRTCManager {
       task.status = 'cancelled';
       task.speed = 0;
       task.eta = 0;
-      // Wipe received chunks from memory immediately for zero-caching security
-      if (task.receivedChunks) {
-        task.receivedChunks = [];
-      }
+      if (task.receivedChunks) task.receivedChunks = [];
       if (task.downloadUrl) {
         URL.revokeObjectURL(task.downloadUrl);
         delete task.downloadUrl;
       }
       this.callbacks.onTransferUpdated(task);
-      this.sendControlMessage(task.peerId, 'TRANSFER_CANCEL', { transferId });
+      this.fileControlAction?.send({ type: 'CANCEL', transferId }, task.peerId);
       playErrorTone();
     }
   }
 
-  private sendControlMessage(targetPeerId: string, type: string, payload: any) {
-    const dc = this.dataChannels.get(targetPeerId);
-    if (dc && dc.readyState === 'open') {
-      dc.send(JSON.stringify({ type, ...payload }));
-    } else {
-      this.sendSignal(targetPeerId, type.toLowerCase(), payload);
-    }
-  }
-
-  // Simulated peer transfer for immediate demo and testing in a single tab
   private async runSimulatedTransfer(
     task: TransferTask,
     file: File,
@@ -689,9 +585,7 @@ export class WebRTCManager {
     const totalChunks = Math.ceil(file.size / CHUNK_SIZE);
     let bytesSent = 0;
     const receivedChunks: ArrayBuffer[] = [];
-
-    // Simulate high-speed local Wi-Fi transfer (~18-35 MB/s)
-    const simulatedChunkDelayMs = Math.max(8, Math.min(35, Math.floor(250 / totalChunks)));
+    const simulatedChunkDelayMs = Math.max(8, Math.min(30, Math.floor(200 / totalChunks)));
 
     for (let i = 0; i < totalChunks; i++) {
       if (this.cancelledTransfers.has(task.id)) {
@@ -704,7 +598,7 @@ export class WebRTCManager {
         task.status = 'paused';
         task.speed = 0;
         this.callbacks.onTransferUpdated(task);
-        await new Promise(r => setTimeout(r, 300));
+        await new Promise((r) => setTimeout(r, 300));
         if (this.cancelledTransfers.has(task.id)) return;
       }
 
@@ -717,12 +611,8 @@ export class WebRTCManager {
       const slice = file.slice(start, end);
       const rawChunk = await slice.arrayBuffer();
 
-      // Real encryption on sender side
       const { encrypted, iv } = await encryptChunk(key, rawChunk, i);
-
-      await new Promise(r => setTimeout(r, simulatedChunkDelayMs));
-
-      // Real decryption on simulated peer side
+      await new Promise((r) => setTimeout(r, simulatedChunkDelayMs));
       const decrypted = await decryptChunk(key, encrypted, iv);
       receivedChunks.push(decrypted);
 
@@ -737,7 +627,6 @@ export class WebRTCManager {
     const fullBuffer = await file.arrayBuffer();
     task.checksum = await computeSHA256(fullBuffer);
 
-    // Assemble blob and verify download capability
     const simulatedBlob = new Blob(receivedChunks, { type: file.type });
     const blobUrl = URL.createObjectURL(simulatedBlob);
     task.downloadUrl = blobUrl;
@@ -754,7 +643,6 @@ export class WebRTCManager {
     });
   }
 
-  // Purge all in-memory buffers for privacy
   public purgeAllCaches() {
     for (const task of this.activeTransfers.values()) {
       if (task.downloadUrl) {
