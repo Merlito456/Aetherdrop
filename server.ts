@@ -101,6 +101,9 @@ function routeSignalMessage(msg: SignalMessage, targetId?: string, targetPin?: s
   const currentRoom = roomId || 'default-lan';
   const deliveredPeerIds = new Set<string>();
 
+  // Extract PIN if targetId is formatted as peer_pin_XXXX
+  const effectivePin = (targetPin || (targetId && String(targetId).startsWith('peer_pin_') ? String(targetId).replace('peer_pin_', '') : undefined))?.trim();
+
   // 1. Direct delivery by targetId if specified and not 'room'
   if (targetId && targetId !== 'room') {
     if (peers.has(targetId) || peerSockets.has(targetId)) {
@@ -111,11 +114,10 @@ function routeSignalMessage(msg: SignalMessage, targetId?: string, targetPin?: s
     }
   }
 
-  // 2. Direct delivery by targetPin if specified (across all rooms)
-  if (targetPin) {
-    const cleanPin = String(targetPin).trim();
+  // 2. Direct delivery by effective PIN (across all rooms)
+  if (effectivePin) {
     for (const [id, peer] of peers.entries()) {
-      if (peer.pin === cleanPin && id !== msg.senderId) {
+      if (peer.pin === effectivePin && id !== msg.senderId) {
         if (!messageQueues.has(id)) messageQueues.set(id, []);
         messageQueues.get(id)!.push(msg);
         sendToPeer(id, msg);
@@ -125,7 +127,7 @@ function routeSignalMessage(msg: SignalMessage, targetId?: string, targetPin?: s
   }
 
   // 3. Room broadcast if explicitly addressed to room or untargeted
-  if (targetId === 'room' || (!targetId && !targetPin) || (targetId === 'room' && deliveredPeerIds.size === 0)) {
+  if (targetId === 'room' || (!targetId && !effectivePin) || (targetId === 'room' && deliveredPeerIds.size === 0)) {
     for (const [id, peer] of peers.entries()) {
       if (peer.roomId === currentRoom && id !== msg.senderId && !deliveredPeerIds.has(id)) {
         if (!messageQueues.has(id)) messageQueues.set(id, []);
@@ -191,13 +193,13 @@ wss.on('connection', (ws) => {
         // Fast-path WebSocket binary chunk relay: route directly to target peer socket or by targetPin
         const { targetId, targetPin, transferId, chunkIdx, data } = parsed;
         if (data) {
-          let targetWs = targetId && targetId !== 'room' ? peerSockets.get(targetId) : undefined;
+          let targetWs = targetId && targetId !== 'room' && !String(targetId).startsWith('peer_pin_') ? peerSockets.get(targetId) : undefined;
+          const effectiveTargetPin = (targetPin || (targetId && String(targetId).startsWith('peer_pin_') ? String(targetId).replace('peer_pin_', '') : undefined))?.trim();
           
-          // Fallback: look up socket by targetPin
-          if (!targetWs && targetPin) {
-            const cleanPin = String(targetPin).trim();
+          // Fallback: look up socket by effective PIN
+          if (!targetWs && effectiveTargetPin) {
             for (const [id, peer] of peers.entries()) {
-              if (peer.pin === cleanPin && id !== clientPeerId) {
+              if (peer.pin === effectiveTargetPin && id !== clientPeerId) {
                 targetWs = peerSockets.get(id);
                 if (targetWs) break;
               }
@@ -207,10 +209,11 @@ wss.on('connection', (ws) => {
           // Fallback: lookup from relayTransfers
           if (!targetWs && transferId && relayTransfers.has(transferId)) {
             const relay = relayTransfers.get(transferId)!;
-            if (relay.targetId) targetWs = peerSockets.get(relay.targetId);
-            if (!targetWs && relay.targetPin) {
+            if (relay.targetId && !relay.targetId.startsWith('peer_pin_')) targetWs = peerSockets.get(relay.targetId);
+            const relayPin = (relay.targetPin || (relay.targetId && relay.targetId.startsWith('peer_pin_') ? relay.targetId.replace('peer_pin_', '') : undefined))?.trim();
+            if (!targetWs && relayPin) {
               for (const [id, peer] of peers.entries()) {
-                if (peer.pin === relay.targetPin && id !== relay.senderId) {
+                if (peer.pin === relayPin && id !== relay.senderId) {
                   targetWs = peerSockets.get(id);
                   if (targetWs) break;
                 }
@@ -574,10 +577,11 @@ app.post(
     relay.lastActive = Date.now();
 
     // Instant WebSocket push to receiver if connected: resolve target socket by ID, PIN, or room
-    let targetWs = relay.targetId ? peerSockets.get(relay.targetId) : undefined;
-    if (!targetWs && relay.targetPin) {
+    let targetWs = relay.targetId && !relay.targetId.startsWith('peer_pin_') ? peerSockets.get(relay.targetId) : undefined;
+    const effectiveTargetPin = (relay.targetPin || (relay.targetId && relay.targetId.startsWith('peer_pin_') ? relay.targetId.replace('peer_pin_', '') : undefined))?.trim();
+    if (!targetWs && effectiveTargetPin) {
       for (const [id, peer] of peers.entries()) {
-        if (peer.pin === relay.targetPin && id !== relay.senderId) {
+        if (peer.pin === effectiveTargetPin && id !== relay.senderId) {
           targetWs = peerSockets.get(id);
           if (targetWs) break;
         }

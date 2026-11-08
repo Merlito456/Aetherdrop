@@ -67,8 +67,8 @@ export interface TransferTask {
   checksum?: string;
   // File object reference when sending
   rawFile?: File;
-  // Chunks storage when receiving
-  receivedChunks?: (ArrayBuffer | Uint8Array)[];
+  // Chunks storage when receiving (Blob support protects memory on 1GB+ files)
+  receivedChunks?: (ArrayBuffer | Uint8Array | Blob)[];
   totalChunks?: number;
   chunkKey?: CryptoKey;
 }

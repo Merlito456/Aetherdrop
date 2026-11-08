@@ -782,6 +782,21 @@ export class WebRTCManager {
       };
       this.peers.set(remotePeer.id, remotePeer);
       this.peerHeartbeats.set(remotePeer.id, Date.now());
+
+      // If a placeholder peer_pin_XXXX exists, clean it up and remap tasks
+      if (remotePeer.pin) {
+        const placeholderId = `peer_pin_${remotePeer.pin}`;
+        if (this.peers.has(placeholderId)) {
+          this.peers.delete(placeholderId);
+        }
+        for (const task of this.activeTransfers.values()) {
+          if (task.peerId === placeholderId) {
+            task.peerId = remotePeer.id;
+            task.peerName = remotePeer.name;
+          }
+        }
+      }
+
       this.broadcastPeersList();
       playPeerConnectedChime();
       saveRecentPeer(remotePeer);
@@ -1433,8 +1448,22 @@ export class WebRTCManager {
 
     // 3. Fast-path: Check for already open WebRTC DataChannel (0ms delay) or wait up to 4500ms
     let dc: RTCDataChannel | null = null;
-    const existingDc = this.dataChannels.get(targetPeer.id);
-    const stripeOpen = this.peerChannelStripes.get(targetPeer.id)?.find((c) => c.readyState === 'open');
+    let actualPeerId = targetPeer.id;
+
+    if (targetPeer.pin) {
+      for (const [id, p] of this.peers.entries()) {
+        if (p.pin === targetPeer.pin && id !== targetPeer.id && !id.startsWith('peer_pin_')) {
+          actualPeerId = id;
+          break;
+        }
+      }
+    }
+
+    const existingDc = this.dataChannels.get(actualPeerId) || this.dataChannels.get(targetPeer.id);
+    const stripeOpen =
+      this.peerChannelStripes.get(actualPeerId)?.find((c) => c.readyState === 'open') ||
+      this.peerChannelStripes.get(targetPeer.id)?.find((c) => c.readyState === 'open');
+
     if (existingDc && existingDc.readyState === 'open') {
       dc = existingDc;
     } else if (stripeOpen) {
@@ -1442,8 +1471,8 @@ export class WebRTCManager {
     } else {
       try {
         dc = await Promise.race([
-          this.ensureDataChannelConnected(targetPeer.id),
-          new Promise<null>((_, reject) => setTimeout(() => reject(new Error('DC_WAIT_TIMEOUT')), 4500)),
+          this.ensureDataChannelConnected(actualPeerId),
+          new Promise<null>((_, reject) => setTimeout(() => reject(new Error('DC_WAIT_TIMEOUT')), 3500)),
         ]);
       } catch {
         dc = null;
@@ -1456,7 +1485,7 @@ export class WebRTCManager {
       } catch {}
       task.transportType = this.isTetherMode ? 'webrtc-striped' : 'webrtc-direct';
       try {
-        await this.streamFileChunks(task, file, key, targetPeer.id, dc);
+        await this.streamFileChunks(task, file, key, actualPeerId, dc);
       } catch (err) {
         console.warn('[AetherDrop] WebRTC stream interrupted, streaming via relay:', err);
         task.transportType = 'relay-stream';
@@ -1644,8 +1673,14 @@ export class WebRTCManager {
           const bytes = new Uint8Array(packetData);
           let binaryStr = '';
           const len = bytes.byteLength;
-          for (let b = 0; b < len; b += 8192) {
-            binaryStr += String.fromCharCode.apply(null, bytes.subarray(b, Math.min(b + 8192, len)) as any);
+          const step = 16384;
+          for (let b = 0; b < len; b += step) {
+            const slice = bytes.subarray(b, Math.min(b + step, len));
+            let chunkStr = '';
+            for (let s = 0; s < slice.length; s++) {
+              chunkStr += String.fromCharCode(slice[s]);
+            }
+            binaryStr += chunkStr;
           }
           this.wsClient.send(JSON.stringify({
             type: 'WS_RELAY_CHUNK',
@@ -1680,8 +1715,8 @@ export class WebRTCManager {
       bytesSent += (chunkEnd - chunkStart);
       task.bytesTransferred = bytesSent;
       task.progress = Math.min(100, Math.round((bytesSent / file.size) * 100));
-      if ((idx & 15) === 0 || bytesSent >= file.size) {
-        this.notifyTransferProgress(task, false);
+      if (idx === 0 || (idx & 15) === 0 || bytesSent >= file.size) {
+        this.notifyTransferProgress(task, idx === 0);
       }
     };
 
@@ -1762,10 +1797,6 @@ export class WebRTCManager {
         blockStart = 0;
       }
 
-      // Reusable typed array buffer pool for turbo mode: eliminates thousands of micro-allocations & GC pauses
-      const turboPacket = new Uint8Array(4 + CHUNK_SIZE);
-      const turboView = new DataView(turboPacket.buffer);
-
       for (let chunkIdx = 0; chunkIdx < totalChunks; chunkIdx++) {
         // Dynamically query all open parallel DataChannels
         const openStripes = this.peerChannelStripes.get(targetPeerId)?.filter((c) => c.readyState === 'open') || [];
@@ -1819,10 +1850,10 @@ export class WebRTCManager {
         }
 
         if (task.encryptionMode === 'turbo-dtls') {
-          // Turbo Hardware-Accelerated (Native DTLS AES-256-GCM)
-          // Reusable zero-allocation packet view: [4 bytes Uint32 chunkIdx] [Raw Chunk Data]
-          turboView.setUint32(0, chunkIdx, false);
-          turboPacket.set(new Uint8Array(blockBuffer, offsetInBlock, chunkSize), 4);
+          // Dedicated buffer allocation per chunk ensures parallel SCTP channels never corrupt in-flight data
+          const packet = new Uint8Array(4 + chunkSize);
+          new DataView(packet.buffer).setUint32(0, chunkIdx, false);
+          packet.set(new Uint8Array(blockBuffer, offsetInBlock, chunkSize), 4);
 
           // Pipelined SCTP Backpressure: Pause only when chosen channel exceeds safe window
           if (activeChannel.bufferedAmount > activeMaxBuffer) {
@@ -1835,7 +1866,7 @@ export class WebRTCManager {
             activeChannel = fallback;
           }
 
-          activeChannel.send(turboPacket.subarray(0, 4 + chunkSize));
+          activeChannel.send(packet);
         } else {
           // Dual-Layer Encryption (DTLS + WebCrypto AES-GCM)
           const rawChunk = blockBuffer.slice(offsetInBlock, offsetInBlock + chunkSize);
@@ -1858,16 +1889,16 @@ export class WebRTCManager {
             activeChannel = fallback;
           }
 
-          activeChannel.send(packet.buffer);
+          activeChannel.send(packet);
         }
 
         bytesSent += chunkSize;
         task.bytesTransferred = bytesSent;
         task.progress = Math.min(100, Math.round((bytesSent / file.size) * 100));
 
-        // Yield loop throttle: only notify every 32 chunks to keep main JS thread dedicated to I/O
-        if ((chunkIdx & 31) === 0 || bytesSent >= file.size) {
-          this.notifyTransferProgress(task, false);
+        // Yield loop throttle: update immediately on first chunk, then every 32 chunks
+        if (chunkIdx === 0 || (chunkIdx & 31) === 0 || bytesSent >= file.size) {
+          this.notifyTransferProgress(task, chunkIdx === 0);
         }
       }
 
@@ -2024,20 +2055,23 @@ export class WebRTCManager {
 
     if (task.encryptionMode === 'turbo-dtls') {
       const rawChunk = new Uint8Array(data, 4);
-      task.receivedChunks[chunkIdx] = rawChunk;
+      // For large files (> 32 MB), store chunks as native Blobs to prevent V8 JavaScript heap exhaustion
+      task.receivedChunks[chunkIdx] = task.fileSize > 32 * 1024 * 1024 ? new Blob([rawChunk]) : rawChunk;
       task.bytesTransferred += rawChunk.byteLength;
       task.progress = Math.min(100, Math.round((task.bytesTransferred / task.fileSize) * 100));
-      this.notifyTransferProgress(task, false);
+      const isInitial = task.bytesTransferred <= rawChunk.byteLength * 2;
+      this.notifyTransferProgress(task, isInitial);
     } else {
       if (data.byteLength < 16 || !task.chunkKey) return;
       const iv = new Uint8Array(data, 4, 12);
       const ciphertext = data.slice(16);
       try {
         const decrypted = await decryptChunk(task.chunkKey, ciphertext, iv);
-        task.receivedChunks[chunkIdx] = decrypted;
+        task.receivedChunks[chunkIdx] = task.fileSize > 32 * 1024 * 1024 ? new Blob([decrypted]) : decrypted;
         task.bytesTransferred += decrypted.byteLength;
         task.progress = Math.min(100, Math.round((task.bytesTransferred / task.fileSize) * 100));
-        this.notifyTransferProgress(task, false);
+        const isInitial = task.bytesTransferred <= decrypted.byteLength * 2;
+        this.notifyTransferProgress(task, isInitial);
       } catch (err) {
         console.error('Decryption failed for chunk:', err);
         task.status = 'error';
@@ -2239,20 +2273,47 @@ export class WebRTCManager {
       } catch (e) {
         console.warn('DataChannel message parse error:', e);
       }
-    } else if (data instanceof ArrayBuffer) {
-      if (data.byteLength < 4) return;
-
-      for (const task of this.activeTransfers.values()) {
-        const isTarget =
-          task.direction === 'receive' &&
-          (task.status === 'transferring' || task.status === 'connecting') &&
-          (task.peerId === peerId || this.activeTransfers.size === 1);
-        if (isTarget) {
-          task.status = 'transferring';
-          task.transportType = this.isTetherMode ? 'webrtc-striped' : 'webrtc-direct';
-          await this.processIncomingChunkPacket(task, data);
-          break;
+    } else {
+      // Binary chunk packet: can arrive as ArrayBuffer, Blob, or ArrayBufferView
+      let arrayBuf: ArrayBuffer | null = null;
+      if (data instanceof ArrayBuffer) {
+        arrayBuf = data;
+      } else if (data instanceof Blob) {
+        try {
+          arrayBuf = await data.arrayBuffer();
+        } catch {
+          arrayBuf = null;
         }
+      } else if (ArrayBuffer.isView(data)) {
+        const copy = new Uint8Array(data.byteLength);
+        copy.set(new Uint8Array(data.buffer, data.byteOffset, data.byteLength));
+        arrayBuf = copy.buffer;
+      }
+
+      if (!arrayBuf || arrayBuf.byteLength < 4) return;
+
+      // Find active receiving task:
+      // 1. Direct match by peerId
+      // 2. Or fallback to any active receiving task (since a receiver processes an active session)
+      const receivingTasks = Array.from(this.activeTransfers.values()).filter(
+        (t) => t.direction === 'receive' && (t.status === 'transferring' || t.status === 'connecting')
+      );
+
+      let targetTask = receivingTasks.find((t) => t.peerId === peerId);
+      if (!targetTask && receivingTasks.length > 0) {
+        const remotePeer = this.peers.get(peerId);
+        if (remotePeer?.pin) {
+          targetTask = receivingTasks.find((t) => t.peerId.includes(remotePeer.pin) || t.peerName === remotePeer.name);
+        }
+        if (!targetTask) {
+          targetTask = receivingTasks[0];
+        }
+      }
+
+      if (targetTask) {
+        targetTask.status = 'transferring';
+        targetTask.transportType = this.isTetherMode ? 'webrtc-striped' : 'webrtc-direct';
+        await this.processIncomingChunkPacket(targetTask, arrayBuf);
       }
     }
   }

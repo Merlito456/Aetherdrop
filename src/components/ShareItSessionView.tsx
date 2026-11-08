@@ -545,6 +545,22 @@ export const ShareItSessionView: React.FC<ShareItSessionViewProps> = ({
                             </span>
                           </>
                         )}
+                        {task.status === 'transferring' && task.speed === 0 && task.bytesTransferred === 0 && (
+                          <>
+                            <span aria-hidden="true">·</span>
+                            <span className="text-cyan-600 dark:text-cyan-400 font-semibold animate-pulse">
+                              Starting stream...
+                            </span>
+                          </>
+                        )}
+                        {task.transportType && (
+                          <>
+                            <span aria-hidden="true">·</span>
+                            <span className="text-[10px] px-1.5 py-0.5 rounded bg-neutral-100 dark:bg-neutral-800 text-neutral-600 dark:text-neutral-400 font-mono">
+                              {task.transportType === 'webrtc-striped' ? '8x Striped P2P' : task.transportType === 'webrtc-direct' ? 'Direct P2P' : 'High-Speed Relay'}
+                            </span>
+                          </>
+                        )}
                         {task.peakSpeed && task.peakSpeed > 0 && (
                           <>
                             <span aria-hidden="true">·</span>
