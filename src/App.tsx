@@ -165,6 +165,11 @@ export default function App() {
           return copy;
         });
 
+        // If this is an incoming transfer, ensure receiver view transitions into the active session
+        if (updatedTask.direction === 'receive') {
+          setCurrentView((curr) => (curr !== 'session' && curr !== 'send-select' ? 'session' : curr));
+        }
+
         // Update live incoming alert toast
         setIncomingAlert((current) => {
           if (current && current.id === updatedTask.id) {
@@ -188,7 +193,7 @@ export default function App() {
           copy[index] = { ...incomingTask };
           return copy;
         });
-        setCurrentView('session');
+        setCurrentView((curr) => (curr !== 'send-select' ? 'session' : curr));
       },
       onTransferCompleted: (completedTask) => {
         setTransfers((prev) => {
@@ -200,6 +205,9 @@ export default function App() {
           copy[index] = { ...completedTask };
           return copy;
         });
+        if (completedTask.direction === 'receive') {
+          setCurrentView((curr) => (curr !== 'session' && curr !== 'send-select' ? 'session' : curr));
+        }
       },
       onSignalingStatus: (status, msg) => {
         setSignalingStatus(status);

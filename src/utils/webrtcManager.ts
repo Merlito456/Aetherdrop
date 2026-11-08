@@ -45,9 +45,9 @@ function uncapSdpBandwidth(sdpStr: string): string {
 }
 
 // Tuned for Maximum Stability & High-Speed Local Wi-Fi Throughput
-// 60 KB chunk size optimal for WebRTC SCTP DataChannels (under 64 KB MTU max-message limit)
-const CHUNK_SIZE = 60 * 1024; // 60 KB per WebRTC chunk
-const RELAY_CHUNK_SIZE = 512 * 1024; // 512 KB per relay chunk for ultra-fast throughput
+// 64 KB chunk size optimal for WebRTC SCTP DataChannels, WebSocket streaming, and HTTP Relay
+const CHUNK_SIZE = 64 * 1024; // 64 KB per chunk
+const RELAY_CHUNK_SIZE = 64 * 1024; // Uniform 64 KB chunk size ensures 100% boundary alignment across all physical transports
 const BLOCK_READ_SIZE = 32 * 1024 * 1024; // 32 MB bulk disk/memory slice buffer
 const TETHER_BLOCK_READ_SIZE = 64 * 1024 * 1024; // 64 MB prefetch in tether / turbo mode
 const MAX_BUFFERED_AMOUNT = 8 * 1024 * 1024; // 8 MB backpressure pipeline window per channel
@@ -94,6 +94,7 @@ export class WebRTCManager {
   private peers = new Map<string, Peer>();
   private peerHeartbeats = new Map<string, number>();
   private activeTransfers = new Map<string, TransferTask>();
+  private pendingEarlyChunks = new Map<string, Array<{ chunkIdx: number; data: ArrayBuffer }>>();
   private pausedTransfers = new Set<string>();
   private cancelledTransfers = new Set<string>();
   private speedTrackers = new Map<string, { lastBytes: number; lastTime: number }>();
@@ -318,17 +319,24 @@ export class WebRTCManager {
 
           if (data.type === 'WS_INCOMING_CHUNK') {
             const { transferId, chunkIdx, data: b64Data } = data;
+            const binStr = atob(b64Data);
+            const len = binStr.length;
+            const bytes = new Uint8Array(len);
+            for (let i = 0; i < len; i++) {
+              bytes[i] = binStr.charCodeAt(i);
+            }
+
             const task = this.activeTransfers.get(transferId);
-            if (task && task.direction === 'receive' && (!task.receivedChunks || !task.receivedChunks[chunkIdx])) {
+            if (task && task.direction === 'receive') {
               task.transportType = 'relay-stream';
               task.status = 'transferring';
-              const binStr = atob(b64Data);
-              const len = binStr.length;
-              const bytes = new Uint8Array(len);
-              for (let i = 0; i < len; i++) {
-                bytes[i] = binStr.charCodeAt(i);
-              }
               await this.processIncomingChunkPacket(task, bytes.buffer);
+            } else if (!task) {
+              // Buffer early chunks if offer handshake is still in progress
+              if (!this.pendingEarlyChunks.has(transferId)) {
+                this.pendingEarlyChunks.set(transferId, []);
+              }
+              this.pendingEarlyChunks.get(transferId)!.push({ chunkIdx, data: bytes.buffer });
             }
             return;
           }
@@ -512,7 +520,7 @@ export class WebRTCManager {
           }
         }
       } catch {}
-    }, 1200);
+    }, 500);
   }
 
   private initMqttSignaling() {
@@ -854,6 +862,49 @@ export class WebRTCManager {
       if (waiter) {
         waiter(true);
         this.fileAcceptWaiters.delete(packet.transferId);
+      }
+    } else if (type === 'CONTROL_SIGNAL') {
+      let ctrl: any = packet.payload || packet;
+      if (typeof ctrl === 'string') {
+        try { ctrl = JSON.parse(ctrl); } catch {}
+      }
+      if (ctrl?.type === 'FILE_COMPLETE' && ctrl.transferId) {
+        const task = this.activeTransfers.get(ctrl.transferId);
+        if (task && task.status !== 'completed') {
+          if (task.bytesTransferred < task.fileSize) {
+            let attempts = 0;
+            const checkInterval = setInterval(() => {
+              attempts++;
+              if (task.bytesTransferred >= task.fileSize || attempts >= 10) {
+                clearInterval(checkInterval);
+                this.finalizeReceivedFile(task);
+              }
+            }, 50);
+          } else {
+            this.finalizeReceivedFile(task);
+          }
+        }
+      } else if (ctrl?.type === 'CANCEL' && ctrl.transferId) {
+        this.cancelledTransfers.add(ctrl.transferId);
+        const task = this.activeTransfers.get(ctrl.transferId);
+        if (task) {
+          task.status = 'cancelled';
+          this.notifyTransferProgress(task, true);
+        }
+      } else if (ctrl?.type === 'PAUSE' && ctrl.transferId) {
+        this.pausedTransfers.add(ctrl.transferId);
+        const task = this.activeTransfers.get(ctrl.transferId);
+        if (task) {
+          task.status = 'paused';
+          this.notifyTransferProgress(task, true);
+        }
+      } else if (ctrl?.type === 'RESUME' && ctrl.transferId) {
+        this.pausedTransfers.delete(ctrl.transferId);
+        const task = this.activeTransfers.get(ctrl.transferId);
+        if (task) {
+          task.status = 'transferring';
+          this.notifyTransferProgress(task, true);
+        }
       }
     }
   }
@@ -1570,7 +1621,7 @@ export class WebRTCManager {
       fingerprint: task.fingerprint,
     };
 
-    this.sendSignalingMessage({ peerId: task.peerId }, {
+    this.sendSignalingMessage({ peerId: task.peerId, pin: targetPeer.pin }, {
       type: 'FILE_OFFER_SIGNAL',
       payload: offer,
     });
@@ -1849,9 +1900,10 @@ export class WebRTCManager {
           }
         }
 
+        let packet: Uint8Array;
         if (task.encryptionMode === 'turbo-dtls') {
           // Dedicated buffer allocation per chunk ensures parallel SCTP channels never corrupt in-flight data
-          const packet = new Uint8Array(4 + chunkSize);
+          packet = new Uint8Array(4 + chunkSize);
           new DataView(packet.buffer).setUint32(0, chunkIdx, false);
           packet.set(new Uint8Array(blockBuffer, offsetInBlock, chunkSize), 4);
 
@@ -1866,14 +1918,14 @@ export class WebRTCManager {
             activeChannel = fallback;
           }
 
-          activeChannel.send(packet);
+          activeChannel.send(packet.buffer as ArrayBuffer);
         } else {
           // Dual-Layer Encryption (DTLS + WebCrypto AES-GCM)
           const rawChunk = blockBuffer.slice(offsetInBlock, offsetInBlock + chunkSize);
           const { encrypted, iv } = await encryptChunk(key!, rawChunk, chunkIdx);
 
           // Binary Packet: [4 bytes chunkIdx (Uint32)] [12 bytes IV] [Encrypted Payload]
-          const packet = new Uint8Array(16 + encrypted.byteLength);
+          packet = new Uint8Array(16 + encrypted.byteLength);
           const view = new DataView(packet.buffer);
           view.setUint32(0, chunkIdx, false);
           packet.set(iv, 4);
@@ -1889,15 +1941,51 @@ export class WebRTCManager {
             activeChannel = fallback;
           }
 
-          activeChannel.send(packet);
+          activeChannel.send(packet.buffer as ArrayBuffer);
         }
+
+        // Mirror chunk to WebSocket relay & local broadcast for fail-safe receiver update
+        if (this.wsConnected && this.wsClient && this.wsClient.readyState === WebSocket.OPEN) {
+          try {
+            const bytes = packet;
+            let binaryStr = '';
+            const len = bytes.byteLength;
+            const step = 16384;
+            for (let b = 0; b < len; b += step) {
+              const slice = bytes.subarray(b, Math.min(b + step, len));
+              let chunkStr = '';
+              for (let s = 0; s < slice.length; s++) {
+                chunkStr += String.fromCharCode(slice[s]);
+              }
+              binaryStr += chunkStr;
+            }
+            const targetPeer = this.peers.get(targetPeerId);
+            this.wsClient.send(JSON.stringify({
+              type: 'WS_RELAY_CHUNK',
+              targetId: targetPeerId,
+              targetPin: targetPeer?.pin,
+              transferId: task.id,
+              chunkIdx,
+              data: btoa(binaryStr),
+            }));
+          } catch {}
+        }
+
+        try {
+          this.localBroadcastChannel?.postMessage({
+            type: 'RELAY_CHUNK_BROADCAST',
+            transferId: task.id,
+            chunkIdx,
+            data: packet.buffer,
+          });
+        } catch {}
 
         bytesSent += chunkSize;
         task.bytesTransferred = bytesSent;
         task.progress = Math.min(100, Math.round((bytesSent / file.size) * 100));
 
-        // Yield loop throttle: update immediately on first chunk, then every 32 chunks
-        if (chunkIdx === 0 || (chunkIdx & 31) === 0 || bytesSent >= file.size) {
+        // Yield loop throttle: update immediately on first chunk, then every 16 chunks
+        if (chunkIdx === 0 || (chunkIdx & 15) === 0 || bytesSent >= file.size) {
           this.notifyTransferProgress(task, chunkIdx === 0);
         }
       }
@@ -1943,12 +2031,22 @@ export class WebRTCManager {
     const payload = JSON.stringify({ type, transferId, ...extra });
     const dc = this.dataChannels.get(targetPeerId);
     if (dc && dc.readyState === 'open') {
-      dc.send(payload);
+      try { dc.send(payload); } catch {}
     }
-    this.sendSignalingMessage({ peerId: targetPeerId }, {
+    const peer = this.peers.get(targetPeerId);
+    this.sendSignalingMessage({ peerId: targetPeerId, pin: peer?.pin }, {
       type: 'CONTROL_SIGNAL',
       payload,
     });
+    if (type === 'FILE_COMPLETE') {
+      try {
+        fetch('/api/relay/complete', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ transferId }),
+        }).catch(() => {});
+      } catch {}
+    }
   }
 
   private extractOfferPayload(raw: any): any {
@@ -2017,6 +2115,15 @@ export class WebRTCManager {
       this.notifyTransferProgress(task, true);
       playStartTone();
 
+      // Drain any chunks that arrived before the file offer was fully processed
+      const earlyChunks = this.pendingEarlyChunks.get(task.id);
+      if (earlyChunks && earlyChunks.length > 0) {
+        this.pendingEarlyChunks.delete(task.id);
+        for (const item of earlyChunks) {
+          this.processIncomingChunkPacket(task, item.data).catch(() => {});
+        }
+      }
+
       sendTransferNotification('Incoming File Transfer', {
         body: `Receiving ${task.fileName} (${formatBytes(task.fileSize)}) from ${task.peerName}...`,
       });
@@ -2059,8 +2166,12 @@ export class WebRTCManager {
       task.receivedChunks[chunkIdx] = task.fileSize > 32 * 1024 * 1024 ? new Blob([rawChunk]) : rawChunk;
       task.bytesTransferred += rawChunk.byteLength;
       task.progress = Math.min(100, Math.round((task.bytesTransferred / task.fileSize) * 100));
-      const isInitial = task.bytesTransferred <= rawChunk.byteLength * 2;
-      this.notifyTransferProgress(task, isInitial);
+      const shouldNotify =
+        task.bytesTransferred <= rawChunk.byteLength * 2 ||
+        chunkIdx === 0 ||
+        (chunkIdx & 7) === 0 ||
+        task.bytesTransferred >= task.fileSize;
+      this.notifyTransferProgress(task, shouldNotify);
     } else {
       if (data.byteLength < 16 || !task.chunkKey) return;
       const iv = new Uint8Array(data, 4, 12);
@@ -2070,8 +2181,12 @@ export class WebRTCManager {
         task.receivedChunks[chunkIdx] = task.fileSize > 32 * 1024 * 1024 ? new Blob([decrypted]) : decrypted;
         task.bytesTransferred += decrypted.byteLength;
         task.progress = Math.min(100, Math.round((task.bytesTransferred / task.fileSize) * 100));
-        const isInitial = task.bytesTransferred <= decrypted.byteLength * 2;
-        this.notifyTransferProgress(task, isInitial);
+        const shouldNotify =
+          task.bytesTransferred <= decrypted.byteLength * 2 ||
+          chunkIdx === 0 ||
+          (chunkIdx & 7) === 0 ||
+          task.bytesTransferred >= task.fileSize;
+        this.notifyTransferProgress(task, shouldNotify);
       } catch (err) {
         console.error('Decryption failed for chunk:', err);
         task.status = 'error';
@@ -2081,7 +2196,8 @@ export class WebRTCManager {
       }
     }
 
-    if (task.bytesTransferred >= task.fileSize) {
+    const receivedCount = (task.receivedChunks || []).filter(Boolean).length;
+    if (task.bytesTransferred >= task.fileSize || (task.totalChunks && receivedCount >= task.totalChunks)) {
       this.finalizeReceivedFile(task);
     }
   }
@@ -2094,21 +2210,26 @@ export class WebRTCManager {
       task.transportType = 'broadcast-channel';
       task.status = 'transferring';
       await this.processIncomingChunkPacket(task, msg.data);
+    } else if (!task) {
+      if (!this.pendingEarlyChunks.has(msg.transferId)) {
+        this.pendingEarlyChunks.set(msg.transferId, []);
+      }
+      this.pendingEarlyChunks.get(msg.transferId)!.push({ chunkIdx: msg.chunkIdx || 0, data: msg.data });
     }
   }
 
   // Background High-Speed Binary Relay Stream Puller: Guarantees 100% delivery even with strict NAT / hotspot AP isolation
   private startRelayPuller(task: TransferTask) {
-    let lastAcked = -1;
     let completed = false;
+    let lastAcked = -1;
     const inFlightIndices = new Set<number>();
 
     const poll = async () => {
       if (task.status === 'completed' || task.status === 'cancelled' || completed) return;
 
       try {
-        // 1. High-speed raw binary path
-        const indicesRes = await fetch(`/api/relay/available-indices?transferId=${encodeURIComponent(task.id)}&afterIdx=${lastAcked}&limit=32`);
+        // High-speed raw binary path
+        const indicesRes = await fetch(`/api/relay/available-indices?transferId=${encodeURIComponent(task.id)}`);
         if (indicesRes.ok) {
           const idxData = await indicesRes.json();
           if (idxData && Array.isArray(idxData.indices) && idxData.indices.length > 0) {
@@ -2130,7 +2251,6 @@ export class WebRTCManager {
                 if (chunkRes.ok) {
                   const arrayBuf = await chunkRes.arrayBuffer();
                   await this.processIncomingChunkPacket(task, arrayBuf);
-                  if (idx > lastAcked) lastAcked = Math.max(lastAcked, idx);
                   return idx;
                 }
               } catch {}
@@ -2149,8 +2269,8 @@ export class WebRTCManager {
             }
           }
 
-          const allChunksReceived = task.receivedChunks && task.receivedChunks.filter(Boolean).length >= (task.totalChunks || 1);
-          if (task.bytesTransferred >= task.fileSize || allChunksReceived) {
+          const receivedCount = (task.receivedChunks || []).filter(Boolean).length;
+          if (task.bytesTransferred >= task.fileSize || (task.totalChunks && receivedCount >= task.totalChunks)) {
             completed = true;
             this.finalizeReceivedFile(task);
             return;
@@ -2329,22 +2449,32 @@ export class WebRTCManager {
       }).catch(() => {});
     } catch {}
 
-    // Direct Blob instantiation without freezing CPU on redundant 1.5 GB SHA-256 calculation
-    const blob = new Blob(task.receivedChunks as any, { type: task.mimeType });
+    const validChunks = task.receivedChunks.filter(
+      (c): c is Blob | Uint8Array => c !== undefined && c !== null
+    );
+    if (validChunks.length === 0) return;
+
+    // Direct Blob instantiation from received chunks
+    const blob = new Blob(validChunks as any[], { type: task.mimeType || 'application/octet-stream' });
     const downloadUrl = URL.createObjectURL(blob);
     task.downloadUrl = downloadUrl;
     task.status = 'completed';
     task.completedAt = Date.now();
     task.progress = 100;
+    task.bytesTransferred = task.fileSize;
     task.speed = 0;
     task.eta = 0;
 
-    const a = document.createElement('a');
-    a.href = downloadUrl;
-    a.download = task.fileName;
-    document.body.appendChild(a);
-    a.click();
-    document.body.removeChild(a);
+    try {
+      const a = document.createElement('a');
+      a.href = downloadUrl;
+      a.download = task.fileName;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+    } catch (e) {
+      console.warn('Auto download error:', e);
+    }
 
     this.notifyTransferProgress(task, true);
     this.callbacks.onTransferCompleted(task);
