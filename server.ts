@@ -3,6 +3,7 @@ import http from 'http';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import { createServer as createViteServer } from 'vite';
+import { WebSocketServer, WebSocket } from 'ws';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -63,8 +64,139 @@ interface RelayTransfer {
 }
 
 const peers = new Map<string, PeerInfo>();
+const peerSockets = new Map<string, WebSocket>();
 const messageQueues = new Map<string, SignalMessage[]>();
 const relayTransfers = new Map<string, RelayTransfer>();
+
+// Fast WebSocket server mounted on same HTTP server
+const wss = new WebSocketServer({ server, path: '/api/ws' });
+
+function broadcastToRoom(roomId: string, message: any, excludePeerId?: string) {
+  const payload = JSON.stringify(message);
+  for (const [id, peer] of peers.entries()) {
+    if (peer.roomId === roomId && id !== excludePeerId) {
+      const ws = peerSockets.get(id);
+      if (ws && ws.readyState === WebSocket.OPEN) {
+        try { ws.send(payload); } catch {}
+      }
+    }
+  }
+}
+
+function sendToPeer(targetId: string, message: any) {
+  const ws = peerSockets.get(targetId);
+  if (ws && ws.readyState === WebSocket.OPEN) {
+    try {
+      ws.send(JSON.stringify(message));
+      return true;
+    } catch {}
+  }
+  return false;
+}
+
+function routeSignalMessage(msg: SignalMessage, targetId?: string, targetPin?: string, roomId?: string) {
+  let delivered = false;
+
+  if (targetPin) {
+    for (const [id, peer] of peers.entries()) {
+      if (peer.pin === targetPin && id !== msg.senderId) {
+        if (!messageQueues.has(id)) messageQueues.set(id, []);
+        messageQueues.get(id)!.push(msg);
+        if (sendToPeer(id, msg)) delivered = true;
+      }
+    }
+  } else if (targetId === 'room' || !targetId) {
+    const currentRoom = roomId || 'default-lan';
+    for (const [id, peer] of peers.entries()) {
+      if (peer.roomId === currentRoom && id !== msg.senderId) {
+        if (!messageQueues.has(id)) messageQueues.set(id, []);
+        messageQueues.get(id)!.push(msg);
+        if (sendToPeer(id, msg)) delivered = true;
+      }
+    }
+  } else {
+    if (!messageQueues.has(targetId)) {
+      messageQueues.set(targetId, []);
+    }
+    messageQueues.get(targetId)!.push(msg);
+    if (sendToPeer(targetId, msg)) delivered = true;
+  }
+
+  return delivered;
+}
+
+wss.on('connection', (ws) => {
+  let clientPeerId: string | null = null;
+
+  ws.on('message', (data) => {
+    try {
+      const parsed = JSON.parse(data.toString());
+      if (parsed.type === 'WS_REGISTER') {
+        const { id, pin, name, deviceType, browser, avatarColor, roomId } = parsed;
+        if (id) {
+          clientPeerId = id;
+          peerSockets.set(id, ws);
+          peers.set(id, {
+            id,
+            pin: pin || '',
+            name: name || 'User',
+            deviceType: deviceType || 'desktop',
+            browser: browser || 'Unknown',
+            avatarColor: avatarColor || '#06b6d4',
+            roomId: roomId || 'default-lan',
+            lastSeen: Date.now(),
+          });
+          if (!messageQueues.has(id)) messageQueues.set(id, []);
+
+          // Flush any pending messages that arrived before WS connection
+          const pending = messageQueues.get(id) || [];
+          if (pending.length > 0) {
+            for (const m of pending) {
+              try { ws.send(JSON.stringify(m)); } catch {}
+            }
+            messageQueues.set(id, []);
+          }
+
+          // Acknowledge connection
+          ws.send(JSON.stringify({ type: 'WS_REGISTER_ACK', peerId: id }));
+        }
+      } else if (parsed.type === 'WS_SIGNAL') {
+        const { senderId, targetId, targetPin, roomId, payload } = parsed;
+        if (senderId) {
+          const msg: SignalMessage = {
+            id: Math.random().toString(36).slice(2, 10),
+            senderId,
+            targetId: targetId || '',
+            type: payload?.type || 'SIGNAL',
+            payload,
+            timestamp: Date.now(),
+          };
+          routeSignalMessage(msg, targetId, targetPin, roomId);
+        }
+      } else if (parsed.type === 'WS_HEARTBEAT') {
+        if (clientPeerId && peers.has(clientPeerId)) {
+          const p = peers.get(clientPeerId)!;
+          p.lastSeen = Date.now();
+          peers.set(clientPeerId, p);
+        }
+      }
+    } catch (e) {
+      console.warn('WS message error:', e);
+    }
+  });
+
+  ws.on('close', () => {
+    if (clientPeerId) {
+      peerSockets.delete(clientPeerId);
+    }
+  });
+
+  ws.on('error', () => {
+    if (clientPeerId) {
+      peerSockets.delete(clientPeerId);
+    }
+  });
+});
 
 // Prune inactive peers & expired relay transfers
 setInterval(() => {
@@ -73,6 +205,11 @@ setInterval(() => {
     if (now - peer.lastSeen > 25000) {
       peers.delete(id);
       messageQueues.delete(id);
+      const ws = peerSockets.get(id);
+      if (ws) {
+        try { ws.close(); } catch {}
+        peerSockets.delete(id);
+      }
     }
   }
   for (const [xferId, xfer] of relayTransfers.entries()) {
@@ -151,30 +288,7 @@ app.post('/api/signal/send', (req, res) => {
     timestamp: Date.now(),
   };
 
-  // Route to target peer by PIN
-  if (targetPin) {
-    for (const [id, peer] of peers.entries()) {
-      if (peer.pin === targetPin && id !== senderId) {
-        if (!messageQueues.has(id)) messageQueues.set(id, []);
-        messageQueues.get(id)!.push(msg);
-      }
-    }
-  } else if (targetId === 'room' || !targetId) {
-    // Room broadcast
-    const currentRoom = roomId || 'default-lan';
-    for (const [id, peer] of peers.entries()) {
-      if (peer.roomId === currentRoom && id !== senderId) {
-        if (!messageQueues.has(id)) messageQueues.set(id, []);
-        messageQueues.get(id)!.push(msg);
-      }
-    }
-  } else {
-    // Direct peer delivery
-    if (!messageQueues.has(targetId)) {
-      messageQueues.set(targetId, []);
-    }
-    messageQueues.get(targetId)!.push(msg);
-  }
+  routeSignalMessage(msg, targetId, targetPin, roomId);
 
   res.json({ success: true });
 });
@@ -196,6 +310,11 @@ app.post('/api/signal/leave', (req, res) => {
   if (id) {
     peers.delete(id);
     messageQueues.delete(id);
+    const ws = peerSockets.get(id);
+    if (ws) {
+      try { ws.close(); } catch {}
+      peerSockets.delete(id);
+    }
   }
   res.json({ ok: true });
 });
@@ -268,7 +387,7 @@ app.post('/api/relay/init', (req, res) => {
 
   relayTransfers.set(transferId, relay);
 
-  // Notify target peer immediately through their message queue
+  // Notify target peer immediately through WebSocket and message queue
   if (targetId) {
     const notifyMsg: SignalMessage = {
       id: Math.random().toString(36).slice(2, 10),
@@ -290,10 +409,7 @@ app.post('/api/relay/init', (req, res) => {
       },
       timestamp: Date.now(),
     };
-    if (!messageQueues.has(targetId)) {
-      messageQueues.set(targetId, []);
-    }
-    messageQueues.get(targetId)!.push(notifyMsg);
+    routeSignalMessage(notifyMsg, targetId);
   }
 
   res.json({ ok: true, transferId });
@@ -301,7 +417,7 @@ app.post('/api/relay/init', (req, res) => {
 
 app.post(
   '/api/relay/chunk',
-  express.raw({ type: '*/*', limit: '10mb' }),
+  express.raw({ type: '*/*', limit: '20mb' }),
   (req, res) => {
     const transferId = req.query.transferId as string;
     const chunkIdx = parseInt(req.query.chunkIdx as string, 10);
@@ -324,6 +440,66 @@ app.post(
     res.json({ ok: true, chunkIdx });
   }
 );
+
+// High-speed raw binary chunk endpoint: zero base64 CPU overhead
+app.get('/api/relay/chunk-binary', (req, res) => {
+  const transferId = req.query.transferId as string;
+  const chunkIdx = parseInt(req.query.chunkIdx as string, 10);
+
+  if (!transferId || isNaN(chunkIdx)) {
+    res.status(400).send('Missing transferId or chunkIdx');
+    return;
+  }
+
+  const relay = relayTransfers.get(transferId);
+  if (!relay || !relay.chunks.has(chunkIdx)) {
+    res.status(404).send('Chunk not ready');
+    return;
+  }
+
+  const buf = relay.chunks.get(chunkIdx)!;
+  relay.lastActive = Date.now();
+  res.setHeader('Content-Type', 'application/octet-stream');
+  res.setHeader('Content-Length', String(buf.byteLength));
+  res.setHeader('X-Chunk-Index', String(chunkIdx));
+  res.send(buf);
+});
+
+// Lightweight index discovery for parallel binary pulling
+app.get('/api/relay/available-indices', (req, res) => {
+  const transferId = req.query.transferId as string;
+  const afterIdx = parseInt((req.query.afterIdx as string) || '-1', 10);
+  const limit = Math.min(parseInt((req.query.limit as string) || '32', 10), 64);
+
+  if (!transferId) {
+    res.status(400).json({ error: 'Missing transferId' });
+    return;
+  }
+
+  const relay = relayTransfers.get(transferId);
+  if (!relay) {
+    res.status(404).json({ error: 'Relay transfer not found' });
+    return;
+  }
+
+  relay.lastActive = Date.now();
+  const available: number[] = [];
+  const chunkKeys = Array.from(relay.chunks.keys()).sort((a, b) => a - b);
+
+  for (const idx of chunkKeys) {
+    if (idx > afterIdx) {
+      available.push(idx);
+      if (available.length >= limit) break;
+    }
+  }
+
+  res.json({
+    transferId,
+    totalChunks: relay.totalChunks,
+    completed: relay.completed,
+    indices: available,
+  });
+});
 
 app.get('/api/relay/pull', (req, res) => {
   const transferId = req.query.transferId as string;
