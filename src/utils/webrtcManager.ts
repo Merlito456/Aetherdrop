@@ -13,22 +13,14 @@ import { sendTransferNotification } from './notifications';
 import { formatBytes } from './formatters';
 import mqtt, { MqttClient } from 'mqtt';
 
-const CHUNK_SIZE = 64 * 1024; // 64 KB per chunk
-const MAX_BUFFERED_AMOUNT = 512 * 1024; // 512 KB backpressure ceiling
+const CHUNK_SIZE = 64 * 1024; // 64 KB per chunk (standard safe WebRTC MTU)
+const MAX_BUFFERED_AMOUNT = 1024 * 1024; // 1 MB backpressure ceiling
 
 export interface WebRTCManagerCallbacks {
   onPeersUpdated: (peers: Peer[]) => void;
   onTransferUpdated: (transfer: TransferTask) => void;
   onTransferCompleted: (transfer: TransferTask) => void;
-  onIncomingOffer: (transfer: {
-    id: string;
-    fileName: string;
-    fileSize: number;
-    mimeType: string;
-    peerId: string;
-    peerName: string;
-    fingerprint?: string;
-  }) => void;
+  onIncomingOffer: (transfer: TransferTask) => void;
   onSignalingStatus?: (status: 'connected' | 'connecting' | 'offline', message?: string) => void;
 }
 
@@ -44,6 +36,8 @@ export class WebRTCManager {
   // WebRTC PeerConnections & DataChannels
   private peerConnections = new Map<string, RTCPeerConnection>();
   private dataChannels = new Map<string, RTCDataChannel>();
+  private dataChannelWaiters = new Map<string, Array<(dc: RTCDataChannel) => void>>();
+  private fileAcceptWaiters = new Map<string, (accepted: boolean) => void>();
 
   // Peers & Active Transfers
   private peers = new Map<string, Peer>();
@@ -101,7 +95,6 @@ export class WebRTCManager {
     const clean = (newRoom || 'default-lan').toLowerCase().trim();
     if (this.roomId === clean) return;
 
-    // Unsubscribe from old room
     if (this.mqttClient && this.mqttClient.connected) {
       this.mqttClient.unsubscribe(`aetherdrop/rooms/${this.roomId}/broadcast`);
     }
@@ -117,7 +110,6 @@ export class WebRTCManager {
     }
   }
 
-  // Cross-tab discovery on same machine via BroadcastChannel
   private initBroadcastChannel() {
     try {
       if (typeof window !== 'undefined' && 'BroadcastChannel' in window) {
@@ -131,9 +123,8 @@ export class WebRTCManager {
     }
   }
 
-  // Fast, reliable MQTT WebSocket pub/sub signaling
   private initMqttSignaling() {
-    this.callbacks.onSignalingStatus?.('connecting', 'Connecting to real-time discovery relay...');
+    this.callbacks.onSignalingStatus?.('connecting', 'Connecting to discovery network...');
 
     const clientId = `aether_${this.selfPeer.pin}_${Math.random().toString(36).substring(2, 7)}`;
     const brokerUrl = 'wss://broker.emqx.io:8084/mqtt';
@@ -148,10 +139,8 @@ export class WebRTCManager {
       });
 
       this.mqttClient.on('connect', () => {
-        console.log('[AetherDrop] Connected to signaling broker');
         this.callbacks.onSignalingStatus?.('connected', `Online (Room: ${this.roomId})`);
 
-        // Subscribe to Room Broadcast + Personal Inbox + PIN Inbox
         const topics = [
           `aetherdrop/rooms/${this.roomId}/broadcast`,
           `aetherdrop/peers/${this.selfPeer.id}/inbox`,
@@ -176,11 +165,11 @@ export class WebRTCManager {
 
       this.mqttClient.on('error', (err) => {
         console.warn('[AetherDrop] Signaling broker error:', err);
-        this.callbacks.onSignalingStatus?.('offline', 'Signaling offline (Direct PIN/QR available)');
+        this.callbacks.onSignalingStatus?.('offline', 'Signaling offline');
       });
 
       this.mqttClient.on('offline', () => {
-        this.callbacks.onSignalingStatus?.('connecting', 'Reconnecting to discovery relay...');
+        this.callbacks.onSignalingStatus?.('connecting', 'Reconnecting to network...');
       });
     } catch (err) {
       console.warn('MQTT init failed:', err);
@@ -195,12 +184,10 @@ export class WebRTCManager {
       timestamp: Date.now(),
     };
 
-    // 1. Broadcast locally across tabs
     try {
       this.localBroadcastChannel?.postMessage(packet);
     } catch {}
 
-    // 2. Publish to MQTT Broker
     if (this.mqttClient && this.mqttClient.connected) {
       if (target === 'room') {
         this.mqttClient.publish(
@@ -251,7 +238,6 @@ export class WebRTCManager {
     }, 3000);
   }
 
-  // Handle incoming signaling packets
   private async handleSignalingPacket(packet: any) {
     if (!packet || !packet.sender || packet.sender.id === this.selfPeer.id) {
       return;
@@ -273,7 +259,6 @@ export class WebRTCManager {
       this.peerHeartbeats.delete(sender.id);
       this.broadcastPeersList();
     } else if (type === 'CONNECT_REQUEST') {
-      // Incoming connection request (from direct PIN or Radar click)
       await this.initiateWebRTCConnection(sender.id, true);
     } else if (type === 'OFFER') {
       await this.handleWebRTCOffer(sender.id, packet.sdp);
@@ -291,10 +276,17 @@ export class WebRTCManager {
           console.warn('Failed to add ICE candidate:', e);
         }
       }
+    } else if (type === 'FILE_OFFER_SIGNAL') {
+      await this.handleFileOfferMessage(sender.id, packet.payload);
+    } else if (type === 'FILE_ACCEPT_SIGNAL') {
+      const waiter = this.fileAcceptWaiters.get(packet.transferId);
+      if (waiter) {
+        waiter(true);
+        this.fileAcceptWaiters.delete(packet.transferId);
+      }
     }
   }
 
-  // Direct connection by 4-digit PIN
   public connectByPin(pin: string) {
     if (!pin) return;
     const cleanPin = pin.trim();
@@ -305,9 +297,33 @@ export class WebRTCManager {
     });
   }
 
-  // Establish WebRTC DataConnection
+  // Ensure DataChannel is completely open before sending any chunks
+  private ensureDataChannelConnected(targetPeerId: string): Promise<RTCDataChannel> {
+    const existing = this.dataChannels.get(targetPeerId);
+    if (existing && existing.readyState === 'open') {
+      return Promise.resolve(existing);
+    }
+
+    return new Promise((resolve, reject) => {
+      const timeout = setTimeout(() => {
+        reject(new Error('Connection timed out. Peer may be unreachable.'));
+      }, 8000);
+
+      if (!this.dataChannelWaiters.has(targetPeerId)) {
+        this.dataChannelWaiters.set(targetPeerId, []);
+      }
+
+      this.dataChannelWaiters.get(targetPeerId)!.push((dc) => {
+        clearTimeout(timeout);
+        resolve(dc);
+      });
+
+      this.initiateWebRTCConnection(targetPeerId, true);
+    });
+  }
+
   public async initiateWebRTCConnection(targetPeerId: string, isInitiator: boolean = true) {
-    if (this.dataChannels.has(targetPeerId)) {
+    if (this.dataChannels.has(targetPeerId) && this.dataChannels.get(targetPeerId)!.readyState === 'open') {
       return;
     }
 
@@ -331,7 +347,9 @@ export class WebRTCManager {
     };
 
     if (isInitiator) {
-      const dc = pc.createDataChannel('aetherdrop_transfer', { ordered: true });
+      const dc = pc.createDataChannel('aetherdrop_transfer', {
+        ordered: true,
+      });
       this.setupDataChannel(targetPeerId, dc);
 
       const offer = await pc.createOffer();
@@ -386,7 +404,7 @@ export class WebRTCManager {
 
   private setupDataChannel(peerId: string, dc: RTCDataChannel) {
     dc.binaryType = 'arraybuffer';
-    dc.bufferedAmountLowThreshold = 64 * 1024;
+    dc.bufferedAmountLowThreshold = 256 * 1024; // 256 KB
 
     dc.onopen = () => {
       console.log(`[AetherDrop] Direct WebRTC DataChannel OPEN with peer ${peerId}`);
@@ -396,6 +414,15 @@ export class WebRTCManager {
         peer.status = 'connected';
       }
       this.broadcastPeersList();
+
+      // Resolve any pending connection promises
+      const waiters = this.dataChannelWaiters.get(peerId);
+      if (waiters) {
+        for (const resolve of waiters) {
+          resolve(dc);
+        }
+        this.dataChannelWaiters.delete(peerId);
+      }
     };
 
     dc.onclose = () => {
@@ -444,7 +471,6 @@ export class WebRTCManager {
     const transferId = 'xfer_' + Math.random().toString(36).slice(2, 10);
     const totalChunks = Math.ceil(file.size / CHUNK_SIZE);
 
-    // Ephemeral 256-bit AES-GCM key
     const key = await generateTransferKey();
     const rawKey = await exportKeyRaw(key);
     const fingerprint = await generateFingerprint(rawKey);
@@ -480,45 +506,61 @@ export class WebRTCManager {
       return transferId;
     }
 
-    // Ensure connection
-    let dc = this.dataChannels.get(targetPeer.id);
-    if (!dc || dc.readyState !== 'open') {
-      await this.initiateWebRTCConnection(targetPeer.id, true);
-      // Wait briefly for open
-      await new Promise((r) => setTimeout(r, 600));
-      dc = this.dataChannels.get(targetPeer.id);
-    }
+    try {
+      // 1. Ensure DataChannel is connected before streaming
+      const dc = await this.ensureDataChannelConnected(targetPeer.id);
 
-    const offerPayload = JSON.stringify({
-      type: 'FILE_OFFER',
-      transferId,
-      fileName: file.name,
-      fileSize: file.size,
-      mimeType: file.type,
-      totalChunks,
-      rawKey: Array.from(new Uint8Array(rawKey)),
-      fingerprint,
-    });
+      // 2. Prepare metadata offer
+      const offer = {
+        type: 'FILE_OFFER',
+        transferId,
+        fileName: file.name,
+        fileSize: file.size,
+        mimeType: file.type,
+        totalChunks,
+        rawKey: Array.from(new Uint8Array(rawKey)),
+        fingerprint,
+      };
 
-    if (dc && dc.readyState === 'open') {
-      dc.send(offerPayload);
-    } else {
-      // Fallback over signaling
+      // 3. Await receiver confirmation with timeout
+      const acceptPromise = new Promise<boolean>((resolve) => {
+        const timer = setTimeout(() => resolve(true), 2500); // Proceed anyway after 2.5s
+        this.fileAcceptWaiters.set(transferId, (acc) => {
+          clearTimeout(timer);
+          resolve(acc);
+        });
+      });
+
+      dc.send(JSON.stringify(offer));
+
+      // Also send over signaling as backup
       this.sendSignalingMessage({ peerId: targetPeer.id }, {
         type: 'FILE_OFFER_SIGNAL',
-        payload: offerPayload,
+        payload: offer,
       });
+
+      await acceptPromise;
+
+      // 4. Stream binary chunks directly over DataChannel
+      this.streamFileChunks(task, file, key, targetPeer.id, dc);
+    } catch (err: any) {
+      console.error('Send file failed:', err);
+      task.status = 'error';
+      task.errorReason = err?.message || 'Failed to establish peer connection';
+      this.callbacks.onTransferUpdated(task);
+      playErrorTone();
     }
 
-    this.streamFileChunks(task, file, key, targetPeer.id);
     return transferId;
   }
 
+  // High-Speed Binary Streaming (No JSON stringification overhead per chunk)
   private async streamFileChunks(
     task: TransferTask,
     file: File,
     key: CryptoKey,
-    targetPeerId: string
+    targetPeerId: string,
+    dc: RTCDataChannel
   ) {
     task.status = 'transferring';
     task.updatedAt = Date.now();
@@ -539,7 +581,7 @@ export class WebRTCManager {
         task.status = 'paused';
         task.speed = 0;
         this.callbacks.onTransferUpdated(task);
-        await new Promise((r) => setTimeout(r, 400));
+        await new Promise((r) => setTimeout(r, 300));
         if (this.cancelledTransfers.has(task.id)) return;
       }
 
@@ -555,29 +597,26 @@ export class WebRTCManager {
       // Encrypt chunk using AES-256-GCM
       const { encrypted, iv } = await encryptChunk(key, buffer, chunkIdx);
 
-      const dc = this.dataChannels.get(targetPeerId);
-      if (dc && dc.readyState === 'open') {
-        if (dc.bufferedAmount > MAX_BUFFERED_AMOUNT) {
-          await new Promise<void>((resolve) => {
-            const onLow = () => {
-              dc?.removeEventListener('bufferedamountlow', onLow);
-              resolve();
-            };
-            dc?.addEventListener('bufferedamountlow', onLow);
-          });
-        }
+      // Pure Binary Packet Layout:
+      // [4 bytes chunkIndex (Uint32)] [12 bytes IV] [Encrypted Bytes]
+      const packet = new Uint8Array(16 + encrypted.byteLength);
+      const view = new DataView(packet.buffer);
+      view.setUint32(0, chunkIdx, false);
+      packet.set(iv, 4);
+      packet.set(new Uint8Array(encrypted), 16);
 
-        const header = JSON.stringify({
-          type: 'CHUNK_HEADER',
-          transferId: task.id,
-          chunkIdx,
-          iv: Array.from(iv),
-          size: encrypted.byteLength,
+      // High-performance backpressure flow control
+      if (dc.bufferedAmount > MAX_BUFFERED_AMOUNT) {
+        await new Promise<void>((resolve) => {
+          const onLow = () => {
+            dc.removeEventListener('bufferedamountlow', onLow);
+            resolve();
+          };
+          dc.addEventListener('bufferedamountlow', onLow);
         });
-
-        dc.send(header);
-        dc.send(encrypted);
       }
+
+      dc.send(packet.buffer);
 
       bytesSent += (end - start);
       task.bytesTransferred = bytesSent;
@@ -585,10 +624,6 @@ export class WebRTCManager {
 
       this.updateMetrics(task);
       this.callbacks.onTransferUpdated(task);
-
-      if (chunkIdx % 4 === 0) {
-        await new Promise((r) => setTimeout(r, 4));
-      }
     }
 
     const fullBuffer = await file.arrayBuffer();
@@ -614,53 +649,84 @@ export class WebRTCManager {
     const dc = this.dataChannels.get(targetPeerId);
     if (dc && dc.readyState === 'open') {
       dc.send(payload);
-    } else {
-      this.sendSignalingMessage({ peerId: targetPeerId }, {
-        type: 'CONTROL_SIGNAL',
-        payload,
-      });
     }
+    // Also send over signaling as safety net
+    this.sendSignalingMessage({ peerId: targetPeerId }, {
+      type: 'CONTROL_SIGNAL',
+      payload,
+    });
   }
 
-  private pendingChunkHeaders = new Map<string, any>();
+  private async handleFileOfferMessage(peerId: string, offer: any) {
+    if (!offer || !offer.transferId) return;
+    if (this.activeTransfers.has(offer.transferId)) return; // Prevent duplicate registration
+
+    try {
+      const rawKeyBuffer = new Uint8Array(offer.rawKey).buffer;
+      const chunkKey = await importKeyRaw(rawKeyBuffer);
+      const peer = this.peers.get(peerId);
+
+      const task: TransferTask = {
+        id: offer.transferId,
+        fileName: offer.fileName,
+        fileSize: offer.fileSize,
+        mimeType: offer.mimeType,
+        direction: 'receive',
+        peerId,
+        peerName: peer ? peer.name : 'Nearby Peer',
+        bytesTransferred: 0,
+        progress: 0,
+        speed: 0,
+        eta: 0,
+        status: 'transferring',
+        startedAt: Date.now(),
+        updatedAt: Date.now(),
+        isEncrypted: true,
+        fingerprint: offer.fingerprint,
+        chunkKey,
+        totalChunks: offer.totalChunks,
+        receivedChunks: new Array(offer.totalChunks),
+      };
+
+      this.activeTransfers.set(task.id, task);
+      this.speedTrackers.set(task.id, { lastBytes: 0, lastTime: Date.now() });
+
+      // Notify UI immediately!
+      this.callbacks.onIncomingOffer(task);
+      this.callbacks.onTransferUpdated(task);
+      playStartTone();
+
+      sendTransferNotification('Incoming File Transfer', {
+        body: `Receiving ${task.fileName} (${formatBytes(task.fileSize)}) from ${task.peerName}...`,
+      });
+
+      // Send acceptance confirmation back
+      const dc = this.dataChannels.get(peerId);
+      const acceptMsg = JSON.stringify({ type: 'FILE_ACCEPT', transferId: task.id });
+      if (dc && dc.readyState === 'open') {
+        dc.send(acceptMsg);
+      }
+      this.sendSignalingMessage({ peerId }, {
+        type: 'FILE_ACCEPT_SIGNAL',
+        transferId: task.id,
+      });
+    } catch (e) {
+      console.warn('Failed to parse file offer:', e);
+    }
+  }
 
   private async handleDataChannelMessage(peerId: string, data: any) {
     if (typeof data === 'string') {
       try {
         const msg = JSON.parse(data);
         if (msg.type === 'FILE_OFFER') {
-          const rawKeyBuffer = new Uint8Array(msg.rawKey).buffer;
-          const chunkKey = await importKeyRaw(rawKeyBuffer);
-          const peer = this.peers.get(peerId);
-
-          const task: TransferTask = {
-            id: msg.transferId,
-            fileName: msg.fileName,
-            fileSize: msg.fileSize,
-            mimeType: msg.mimeType,
-            direction: 'receive',
-            peerId,
-            peerName: peer ? peer.name : 'Nearby Peer',
-            bytesTransferred: 0,
-            progress: 0,
-            speed: 0,
-            eta: 0,
-            status: 'transferring',
-            startedAt: Date.now(),
-            updatedAt: Date.now(),
-            isEncrypted: true,
-            fingerprint: msg.fingerprint,
-            chunkKey,
-            totalChunks: msg.totalChunks,
-            receivedChunks: [],
-          };
-
-          this.activeTransfers.set(task.id, task);
-          this.speedTrackers.set(task.id, { lastBytes: 0, lastTime: Date.now() });
-          this.callbacks.onTransferUpdated(task);
-          playStartTone();
-        } else if (msg.type === 'CHUNK_HEADER') {
-          this.pendingChunkHeaders.set(peerId, msg);
+          await this.handleFileOfferMessage(peerId, msg);
+        } else if (msg.type === 'FILE_ACCEPT') {
+          const waiter = this.fileAcceptWaiters.get(msg.transferId);
+          if (waiter) {
+            waiter(true);
+            this.fileAcceptWaiters.delete(msg.transferId);
+          }
         } else if (msg.type === 'PAUSE') {
           this.pausedTransfers.add(msg.transferId);
           const task = this.activeTransfers.get(msg.transferId);
@@ -693,15 +759,22 @@ export class WebRTCManager {
         console.warn('DataChannel message parse error:', e);
       }
     } else if (data instanceof ArrayBuffer) {
-      const header = this.pendingChunkHeaders.get(peerId);
-      if (header) {
-        const task = this.activeTransfers.get(header.transferId);
-        if (task && task.chunkKey) {
+      // Pure Binary Chunk Packet Layout:
+      // [4 bytes chunkIndex (UInt32)] [12 bytes IV] [Ciphertext bytes]
+      if (data.byteLength < 16) return;
+
+      const view = new DataView(data);
+      const chunkIdx = view.getUint32(0, false);
+      const iv = new Uint8Array(data, 4, 12);
+      const ciphertext = data.slice(16);
+
+      // Find the receiving task for this peer
+      for (const task of this.activeTransfers.values()) {
+        if (task.peerId === peerId && task.direction === 'receive' && task.status === 'transferring' && task.chunkKey) {
           try {
-            const iv = new Uint8Array(header.iv);
-            const decrypted = await decryptChunk(task.chunkKey, data, iv);
+            const decrypted = await decryptChunk(task.chunkKey, ciphertext, iv);
             if (!task.receivedChunks) task.receivedChunks = [];
-            task.receivedChunks[header.chunkIdx] = decrypted;
+            task.receivedChunks[chunkIdx] = decrypted;
             task.bytesTransferred += decrypted.byteLength;
             task.progress = Math.min(100, Math.round((task.bytesTransferred / task.fileSize) * 100));
 
@@ -713,8 +786,8 @@ export class WebRTCManager {
             task.errorReason = 'Cryptographic verification failed';
             this.callbacks.onTransferUpdated(task);
           }
+          break;
         }
-        this.pendingChunkHeaders.delete(peerId);
       }
     }
   }
@@ -768,7 +841,7 @@ export class WebRTCManager {
     }
 
     const elapsed = (now - tracker.lastTime) / 1000;
-    if (elapsed >= 0.5) {
+    if (elapsed >= 0.3) {
       const bytesDiff = task.bytesTransferred - tracker.lastBytes;
       const currentSpeed = bytesDiff / elapsed;
       task.speed = task.speed === 0 ? currentSpeed : Math.round(task.speed * 0.4 + currentSpeed * 0.6);
@@ -835,7 +908,6 @@ export class WebRTCManager {
     const totalChunks = Math.ceil(file.size / CHUNK_SIZE);
     let bytesSent = 0;
     const receivedChunks: ArrayBuffer[] = [];
-    const simulatedChunkDelayMs = Math.max(8, Math.min(30, Math.floor(200 / totalChunks)));
 
     for (let i = 0; i < totalChunks; i++) {
       if (this.cancelledTransfers.has(task.id)) {
@@ -862,7 +934,6 @@ export class WebRTCManager {
       const rawChunk = await slice.arrayBuffer();
 
       const { encrypted, iv } = await encryptChunk(key, rawChunk, i);
-      await new Promise((r) => setTimeout(r, simulatedChunkDelayMs));
       const decrypted = await decryptChunk(key, encrypted, iv);
       receivedChunks.push(decrypted);
 
@@ -872,6 +943,11 @@ export class WebRTCManager {
 
       this.updateMetrics(task);
       this.callbacks.onTransferUpdated(task);
+
+      // Smooth simulated pacing
+      if (i % 2 === 0) {
+        await new Promise((r) => setTimeout(r, 2));
+      }
     }
 
     const fullBuffer = await file.arrayBuffer();

@@ -6,6 +6,7 @@ import {
   requestNotificationPermission,
   getNotificationStatus,
 } from './utils/notifications';
+import { formatBytes } from './utils/formatters';
 import { TopBar } from './components/TopBar';
 import { Dropzone } from './components/Dropzone';
 import { TransferList } from './components/TransferList';
@@ -14,7 +15,7 @@ import { QRCodeModal } from './components/QRCodeModal';
 import { QRScannerModal } from './components/QRScannerModal';
 import { SecurityModal } from './components/SecurityModal';
 import { RoomModal } from './components/RoomModal';
-import { Lock, Wifi, Zap, ShieldCheck, Radio } from 'lucide-react';
+import { Lock, Wifi, Zap, ShieldCheck, Radio, ArrowDownLeft, X } from 'lucide-react';
 
 export default function App() {
   // Theme state
@@ -63,6 +64,9 @@ export default function App() {
   const [isRoomModalOpen, setIsRoomModalOpen] = useState(false);
   const [notificationStatus, setNotificationStatus] = useState<NotificationPermission | 'unsupported'>('default');
 
+  // Real-time incoming transfer alert banner
+  const [incomingAlert, setIncomingAlert] = useState<TransferTask | null>(null);
+
   // Signaling status
   const [signalingStatus, setSignalingStatus] = useState<'connected' | 'connecting' | 'offline'>('connecting');
   const [signalingMessage, setSignalingMessage] = useState<string>('Connecting to discovery network...');
@@ -104,9 +108,25 @@ export default function App() {
           copy[index] = { ...updatedTask };
           return copy;
         });
+
+        // Update live incoming alert banner if it matches
+        setIncomingAlert((current) => {
+          if (current && current.id === updatedTask.id) {
+            if (updatedTask.status === 'completed' || updatedTask.status === 'error' || updatedTask.status === 'cancelled') {
+              setTimeout(() => setIncomingAlert(null), 3000);
+            }
+            return updatedTask;
+          }
+          return current;
+        });
       },
-      onTransferCompleted: () => {},
-      onIncomingOffer: () => {},
+      onIncomingOffer: (incomingTask) => {
+        // 1. Immediately notify receiving device in real-time!
+        setIncomingAlert(incomingTask);
+        // 2. Automatically switch receiver to Transfers view so they see live progress bar!
+        setCurrentTab('transfers');
+      },
+      onTransferCompleted: (_task) => {},
       onSignalingStatus: (status, msg) => {
         setSignalingStatus(status);
         if (msg) setSignalingMessage(msg);
@@ -187,7 +207,6 @@ export default function App() {
           setTimeout(() => handleConnectByPin(pin), 600);
         }
       } else {
-        // Plain PIN code scanned
         handleConnectByPin(decodedText.trim());
       }
     } catch {
@@ -262,6 +281,49 @@ export default function App() {
         onRequestNotification={handleRequestNotification}
         selfPeer={selfPeer}
       />
+
+      {/* Real-time Floating Incoming Transfer Toast / Alert Banner */}
+      {incomingAlert && (
+        <div className="fixed bottom-4 right-4 z-50 max-w-sm w-full bg-white dark:bg-neutral-900 border border-cyan-500/30 rounded-2xl p-4 shadow-xl shadow-cyan-500/10 animate-in slide-in-from-bottom-5 duration-200">
+          <div className="flex items-start justify-between gap-3">
+            <div className="flex items-center gap-2.5">
+              <div className="w-9 h-9 rounded-xl bg-cyan-100 dark:bg-cyan-950/70 text-cyan-600 dark:text-cyan-400 flex items-center justify-center shrink-0">
+                <ArrowDownLeft className="w-5 h-5 animate-bounce" />
+              </div>
+              <div className="min-w-0">
+                <div className="flex items-center gap-2">
+                  <span className="text-xs font-bold text-neutral-900 dark:text-neutral-100 truncate">
+                    {incomingAlert.status === 'completed' ? 'Transfer Completed' : 'Incoming File Transfer'}
+                  </span>
+                  <span className="text-[10px] font-mono text-cyan-600 dark:text-cyan-400 font-semibold">
+                    {incomingAlert.progress}%
+                  </span>
+                </div>
+                <p className="text-xs text-neutral-600 dark:text-neutral-300 truncate">
+                  {incomingAlert.fileName} ({formatBytes(incomingAlert.fileSize)})
+                </p>
+                <p className="text-[11px] text-neutral-400">
+                  From: {incomingAlert.peerName}
+                </p>
+              </div>
+            </div>
+            <button
+              onClick={() => setIncomingAlert(null)}
+              className="text-neutral-400 hover:text-neutral-700 dark:hover:text-neutral-200 p-1"
+            >
+              <X className="w-4 h-4" />
+            </button>
+          </div>
+
+          {/* Mini progress bar */}
+          <div className="mt-3 w-full bg-neutral-200 dark:bg-neutral-800 h-1.5 rounded-full overflow-hidden">
+            <div
+              className="h-full bg-gradient-to-r from-cyan-500 to-blue-500 rounded-full transition-all duration-200"
+              style={{ width: `${incomingAlert.progress}%` }}
+            />
+          </div>
+        </div>
+      )}
 
       {/* Main Content Viewport */}
       <main className="flex-1 max-w-7xl w-full mx-auto px-4 sm:px-6 lg:px-8 py-6 sm:py-8 space-y-6">
@@ -375,7 +437,7 @@ export default function App() {
             <span aria-hidden="true">·</span>
             <span>Local P2P WebRTC File Transfer</span>
             <span aria-hidden="true">·</span>
-            <span className="font-mono text-cyan-600 dark:text-cyan-400">PIN: {selfPeer.pin}</span>
+            <span className="font-mono text-cyan-600 dark:text-cyan-400 font-semibold">PIN: {selfPeer.pin}</span>
           </div>
 
           <div className="flex items-center gap-4">
