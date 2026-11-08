@@ -60,6 +60,21 @@ export default function App() {
     return 'turbo-dtls';
   });
 
+  // Wi-Fi Tethering / Mobile Hotspot Boost Mode (Client connected directly to sender hotspot)
+  const [isTetherMode, setIsTetherMode] = useState<boolean>(() => {
+    if (typeof window !== 'undefined') {
+      const stored = localStorage.getItem('aetherdrop_tether_mode');
+      return stored === 'true';
+    }
+    return false;
+  });
+
+  const handleToggleTetherMode = (enabled: boolean) => {
+    setIsTetherMode(enabled);
+    localStorage.setItem('aetherdrop_tether_mode', String(enabled));
+    managerRef.current?.setTetherMode(enabled);
+  };
+
   // Peer & Room State
   const [selfPeer] = useState<Peer>(() => {
     const info = getOrCreatePeerIdentity();
@@ -151,7 +166,7 @@ export default function App() {
         setSignalingStatus(status);
         if (msg) setSignalingMessage(msg);
       },
-    }, encryptionMode);
+    }, encryptionMode, isTetherMode);
 
     managerRef.current = manager;
     manager.init();
@@ -353,6 +368,8 @@ export default function App() {
             onViewTransfers={() => setCurrentView(activeTransfersCount > 0 ? 'session' : 'transfers-history')}
             simulatedPeerEnabled={simulatedPeerActive}
             onToggleSimulatedPeer={handleToggleSimulatedPeer}
+            isTetherMode={isTetherMode}
+            onToggleTetherMode={handleToggleTetherMode}
           />
         )}
 
@@ -401,6 +418,8 @@ export default function App() {
               localStorage.setItem('aetherdrop_encryption_mode', mode);
               managerRef.current?.setEncryptionMode(mode);
             }}
+            isTetherMode={isTetherMode}
+            onToggleTetherMode={handleToggleTetherMode}
             onPause={handlePause}
             onResume={handleResume}
             onCancel={handleCancel}
@@ -534,6 +553,8 @@ export default function App() {
           localStorage.setItem('aetherdrop_encryption_mode', mode);
           managerRef.current?.setEncryptionMode(mode);
         }}
+        isTetherMode={isTetherMode}
+        onSwitchTetherMode={handleToggleTetherMode}
       />
     </div>
   );

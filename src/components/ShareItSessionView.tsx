@@ -29,6 +29,8 @@ interface ShareItSessionViewProps {
   transfers: TransferTask[];
   encryptionMode?: 'turbo-dtls' | 'dual-crypto';
   onToggleEncryptionMode?: (mode: 'turbo-dtls' | 'dual-crypto') => void;
+  isTetherMode?: boolean;
+  onToggleTetherMode?: (enabled: boolean) => void;
   onPause: (id: string) => void;
   onResume: (id: string) => void;
   onCancel: (id: string) => void;
@@ -41,6 +43,8 @@ export const ShareItSessionView: React.FC<ShareItSessionViewProps> = ({
   transfers,
   encryptionMode = 'turbo-dtls',
   onToggleEncryptionMode,
+  isTetherMode = false,
+  onToggleTetherMode,
   onPause,
   onResume,
   onCancel,
@@ -175,6 +179,52 @@ export const ShareItSessionView: React.FC<ShareItSessionViewProps> = ({
                 </button>
               )}
             </div>
+
+            {/* User-Requested Wi-Fi Tethering / Direct Hotspot Connection Mode Checkbox */}
+            <div className="mt-3.5 w-full max-w-lg">
+              <label
+                className={`flex items-start sm:items-center justify-between gap-3 p-3 rounded-2xl border transition-all cursor-pointer select-none text-left ${
+                  isTetherMode
+                    ? 'border-cyan-500 bg-cyan-500/10 dark:bg-cyan-950/50 text-cyan-950 dark:text-cyan-100 shadow-xs'
+                    : 'border-neutral-200 dark:border-neutral-800 bg-neutral-50/70 dark:bg-neutral-850/60 text-neutral-700 dark:text-neutral-300 hover:border-neutral-300 dark:hover:border-neutral-700'
+                }`}
+              >
+                <div className="flex items-start sm:items-center gap-2.5 min-w-0">
+                  <input
+                    type="checkbox"
+                    checked={isTetherMode}
+                    onChange={(e) => onToggleTetherMode?.(e.target.checked)}
+                    className="mt-0.5 sm:mt-0 w-4 h-4 rounded text-cyan-600 focus:ring-cyan-500 accent-cyan-500 cursor-pointer shrink-0"
+                  />
+                  <div className="flex flex-col min-w-0">
+                    <span className="text-xs font-bold text-neutral-900 dark:text-neutral-100 flex items-center gap-1.5 flex-wrap">
+                      <span>⚡ Wi-Fi Tethering Link (Connected via Sender Hotspot)</span>
+                      <span
+                        className={`text-[10px] px-2 py-0.2 rounded-full font-bold ${
+                          isTetherMode
+                            ? 'bg-emerald-600 text-white animate-pulse'
+                            : 'bg-neutral-200 dark:bg-neutral-700 text-neutral-600 dark:text-neutral-300'
+                        }`}
+                      >
+                        {isTetherMode ? '1-Hop Boost Active' : 'Off'}
+                      </span>
+                    </span>
+                    <span className="text-[11px] text-neutral-500 dark:text-neutral-400 leading-snug mt-0.5">
+                      Check this if PC/laptop is connected to sender via mobile hotspot. Bypasses 20 Mbps cellular carrier NAT for direct 30–80+ MB/s Wi-Fi speed.
+                    </span>
+                  </div>
+                </div>
+                <div className="hidden sm:block text-right shrink-0">
+                  <span
+                    className={`text-[11px] font-mono font-bold ${
+                      isTetherMode ? 'text-cyan-600 dark:text-cyan-400' : 'text-neutral-400'
+                    }`}
+                  >
+                    {isTetherMode ? '16 MB Socket' : '8 MB Socket'}
+                  </span>
+                </div>
+              </label>
+            </div>
           </div>
 
           {/* Receiver / Right Device */}
@@ -232,6 +282,15 @@ export const ShareItSessionView: React.FC<ShareItSessionViewProps> = ({
                         >
                           <Lock className="w-3 h-3" />
                           <span>{task.encryptionMode === 'turbo-dtls' ? 'Turbo DTLS' : 'Dual-Crypto'}</span>
+                        </span>
+                      )}
+                      {(task.isTetherMode || isTetherMode) && (
+                        <span
+                          title="1-Hop Direct Wi-Fi Tether Hotspot Mode Active (16 MB Socket)"
+                          className="flex items-center gap-1 text-[10px] font-mono text-cyan-600 dark:text-cyan-400 bg-cyan-50 dark:bg-cyan-950/60 px-1.5 py-0.5 rounded border border-cyan-200 dark:border-cyan-800"
+                        >
+                          <Zap className="w-3 h-3 text-cyan-500" />
+                          <span>Tether 1-Hop</span>
                         </span>
                       )}
                     </div>

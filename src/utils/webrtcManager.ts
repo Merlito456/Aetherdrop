@@ -74,12 +74,20 @@ export class WebRTCManager {
   private presenceInterval: any = null;
   private pruneInterval: any = null;
   private encryptionMode: EncryptionMode = 'turbo-dtls';
+  private isTetherMode: boolean = false;
 
-  constructor(selfPeer: Peer, roomId: string, callbacks: WebRTCManagerCallbacks, defaultMode: EncryptionMode = 'turbo-dtls') {
+  constructor(
+    selfPeer: Peer,
+    roomId: string,
+    callbacks: WebRTCManagerCallbacks,
+    defaultMode: EncryptionMode = 'turbo-dtls',
+    defaultTetherMode: boolean = false
+  ) {
     this.selfPeer = selfPeer;
     this.roomId = (roomId || 'default-lan').toLowerCase().trim();
     this.callbacks = callbacks;
     this.encryptionMode = defaultMode;
+    this.isTetherMode = defaultTetherMode;
   }
 
   public setEncryptionMode(mode: EncryptionMode) {
@@ -88,6 +96,18 @@ export class WebRTCManager {
 
   public getEncryptionMode(): EncryptionMode {
     return this.encryptionMode;
+  }
+
+  public setTetherMode(enabled: boolean) {
+    this.isTetherMode = enabled;
+    for (const task of this.activeTransfers.values()) {
+      task.isTetherMode = enabled;
+      this.callbacks.onTransferUpdated({ ...task });
+    }
+  }
+
+  public getTetherMode(): boolean {
+    return this.isTetherMode;
   }
 
   public init() {
@@ -383,13 +403,17 @@ export class WebRTCManager {
       return;
     }
 
+    const iceServers = this.isTetherMode
+      ? [{ urls: 'stun:stun.l.google.com:19302' }]
+      : [
+          { urls: 'stun:stun.l.google.com:19302' },
+          { urls: 'stun:stun1.l.google.com:19302' },
+          { urls: 'stun:global.stun.twilio.com:3478' },
+        ];
+
     const pc = new RTCPeerConnection({
-      iceServers: [
-        { urls: 'stun:stun.l.google.com:19302' },
-        { urls: 'stun:stun1.l.google.com:19302' },
-        { urls: 'stun:global.stun.twilio.com:3478' },
-      ],
-      iceCandidatePoolSize: 10,
+      iceServers,
+      iceCandidatePoolSize: this.isTetherMode ? 4 : 10,
     });
 
     this.peerConnections.set(targetPeerId, pc);
@@ -399,6 +423,8 @@ export class WebRTCManager {
         this.sendSignalingMessage({ peerId: targetPeerId }, {
           type: 'ICE_CANDIDATE',
           candidate: event.candidate,
+          isHost: event.candidate.candidate?.includes('typ host'),
+          isTetherMode: this.isTetherMode,
         });
       }
     };
@@ -428,13 +454,17 @@ export class WebRTCManager {
   private async handleWebRTCOffer(senderId: string, sdp: RTCSessionDescriptionInit) {
     let pc = this.peerConnections.get(senderId);
     if (!pc) {
+      const iceServers = this.isTetherMode
+        ? [{ urls: 'stun:stun.l.google.com:19302' }]
+        : [
+            { urls: 'stun:stun.l.google.com:19302' },
+            { urls: 'stun:stun1.l.google.com:19302' },
+            { urls: 'stun:global.stun.twilio.com:3478' },
+          ];
+
       pc = new RTCPeerConnection({
-        iceServers: [
-          { urls: 'stun:stun.l.google.com:19302' },
-          { urls: 'stun:stun1.l.google.com:19302' },
-          { urls: 'stun:global.stun.twilio.com:3478' },
-        ],
-        iceCandidatePoolSize: 10,
+        iceServers,
+        iceCandidatePoolSize: this.isTetherMode ? 4 : 10,
       });
       this.peerConnections.set(senderId, pc);
 
@@ -443,6 +473,8 @@ export class WebRTCManager {
           this.sendSignalingMessage({ peerId: senderId }, {
             type: 'ICE_CANDIDATE',
             candidate: event.candidate,
+            isHost: event.candidate.candidate?.includes('typ host'),
+            isTetherMode: this.isTetherMode,
           });
         }
       };
@@ -575,6 +607,7 @@ export class WebRTCManager {
       updatedAt: Date.now(),
       isEncrypted: true,
       encryptionMode: mode,
+      isTetherMode: this.isTetherMode,
       fingerprint,
       rawFile: file,
       chunkKey: key,
@@ -601,6 +634,7 @@ export class WebRTCManager {
         mimeType: file.type,
         totalChunks,
         encryptionMode: mode,
+        isTetherMode: this.isTetherMode,
         rawKey: rawKey ? Array.from(new Uint8Array(rawKey)) : undefined,
         fingerprint,
       };
@@ -657,6 +691,10 @@ export class WebRTCManager {
       let blockBuffer: ArrayBuffer | null = null;
 
       for (let chunkIdx = 0; chunkIdx < totalChunks; chunkIdx++) {
+        // Dynamically query tether mode so toggling checkbox mid-transfer takes effect immediately
+        const activeBlockSize = this.isTetherMode ? 16 * 1024 * 1024 : BLOCK_READ_SIZE;
+        const activeMaxBuffer = this.isTetherMode ? 16 * 1024 * 1024 : MAX_BUFFERED_AMOUNT;
+
         if (this.cancelledTransfers.has(task.id)) {
           task.status = 'cancelled';
           this.notifyTransferProgress(task, true);
@@ -680,10 +718,10 @@ export class WebRTCManager {
         const chunkEnd = Math.min(chunkStart + CHUNK_SIZE, file.size);
         const chunkSize = chunkEnd - chunkStart;
 
-        // Bulk memory prefetch (8 MB block slices) to eliminate disk contention
-        if (!blockBuffer || chunkStart >= blockStart + BLOCK_READ_SIZE) {
+        // Bulk memory prefetch (8 MB or 16 MB in tether mode) to eliminate disk contention
+        if (!blockBuffer || chunkStart >= blockStart + activeBlockSize) {
           blockStart = chunkStart;
-          const blockEnd = Math.min(blockStart + BLOCK_READ_SIZE, file.size);
+          const blockEnd = Math.min(blockStart + activeBlockSize, file.size);
           blockBuffer = await file.slice(blockStart, blockEnd).arrayBuffer();
         }
 
@@ -698,8 +736,8 @@ export class WebRTCManager {
           // Zero-copy typed array view over blockBuffer
           packet.set(new Uint8Array(blockBuffer, offsetInBlock, chunkSize), 4);
 
-          // SCTP Pipeline Backpressure: Wait only when DataChannel buffer hits MAX_BUFFERED_AMOUNT
-          if (dc.bufferedAmount > MAX_BUFFERED_AMOUNT) {
+          // SCTP Pipeline Backpressure: Wait only when DataChannel buffer hits activeMaxBuffer
+          if (dc.bufferedAmount > activeMaxBuffer) {
             await new Promise<void>((resolve) => {
               let resolved = false;
               const done = () => {
@@ -822,11 +860,16 @@ export class WebRTCManager {
         updatedAt: Date.now(),
         isEncrypted: true,
         encryptionMode,
+        isTetherMode: offer.isTetherMode ?? this.isTetherMode,
         fingerprint: offer.fingerprint || 'DTLS-AES256',
         chunkKey,
         totalChunks: offer.totalChunks,
         receivedChunks: new Array(offer.totalChunks),
       };
+
+      if (offer.isTetherMode) {
+        this.isTetherMode = true;
+      }
 
       this.activeTransfers.set(task.id, task);
       this.speedTrackers.set(task.id, { lastBytes: 0, lastTime: Date.now() });

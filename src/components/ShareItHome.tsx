@@ -27,6 +27,8 @@ interface ShareItHomeProps {
   onViewTransfers: () => void;
   simulatedPeerEnabled: boolean;
   onToggleSimulatedPeer: (enable: boolean) => void;
+  isTetherMode?: boolean;
+  onToggleTetherMode?: (enabled: boolean) => void;
 }
 
 export const ShareItHome: React.FC<ShareItHomeProps> = ({
@@ -41,6 +43,8 @@ export const ShareItHome: React.FC<ShareItHomeProps> = ({
   onViewTransfers,
   simulatedPeerEnabled,
   onToggleSimulatedPeer,
+  isTetherMode = false,
+  onToggleTetherMode,
 }) => {
   const getDeviceIcon = () => {
     switch (selfPeer.deviceType) {
@@ -113,6 +117,46 @@ export const ShareItHome: React.FC<ShareItHomeProps> = ({
             <span>{simulatedPeerEnabled ? 'Test Peer On' : 'Simulate Peer'}</span>
           </button>
         </div>
+      </div>
+
+      {/* Wi-Fi Tethering / Mobile Hotspot Quick-Enable Banner */}
+      <div className={`p-4 rounded-2xl border transition-all ${
+        isTetherMode
+          ? 'bg-cyan-50/70 dark:bg-cyan-950/40 border-cyan-400 dark:border-cyan-700 shadow-xs'
+          : 'bg-white dark:bg-neutral-900 border-neutral-200 dark:border-neutral-800'
+      }`}>
+        <label className="flex items-center justify-between gap-4 cursor-pointer select-none">
+          <div className="flex items-start sm:items-center gap-3 min-w-0">
+            <input
+              type="checkbox"
+              checked={isTetherMode}
+              onChange={(e) => onToggleTetherMode?.(e.target.checked)}
+              className="mt-0.5 sm:mt-0 w-4 h-4 rounded text-cyan-600 focus:ring-cyan-500 accent-cyan-500 cursor-pointer shrink-0"
+            />
+            <div className="min-w-0 text-left">
+              <div className="flex items-center gap-2 flex-wrap">
+                <span className="text-xs sm:text-sm font-bold text-neutral-900 dark:text-neutral-100">
+                  ⚡ Wi-Fi Tethering / Mobile Hotspot Mode
+                </span>
+                <span className={`text-[10px] px-2 py-0.2 rounded-full font-bold ${
+                  isTetherMode
+                    ? 'bg-emerald-600 text-white animate-pulse'
+                    : 'bg-neutral-100 dark:bg-neutral-800 text-neutral-600 dark:text-neutral-400'
+                }`}>
+                  {isTetherMode ? '1-Hop Boost Active (16 MB Socket)' : 'Standard LAN'}
+                </span>
+              </div>
+              <p className="text-[11px] text-neutral-500 dark:text-neutral-400 mt-0.5 leading-snug">
+                Turn ON if client PC/laptop connects directly to sender's phone hotspot. Prioritizes local host ICE routing and removes 20 Mbps cellular throttling.
+              </p>
+            </div>
+          </div>
+          <div className="hidden sm:block text-right shrink-0">
+            <span className="text-xs font-mono font-bold text-cyan-600 dark:text-cyan-400">
+              {isTetherMode ? '30–80+ MB/s' : '15–40 MB/s'}
+            </span>
+          </div>
+        </label>
       </div>
 
       {/* SHAREit Two Big Action Buttons */}

@@ -43,6 +43,7 @@ export interface TransferTask {
   downloadUrl?: string; // in-memory ObjectURL (revoked on purge/dismiss)
   isEncrypted: boolean;
   encryptionMode?: EncryptionMode;
+  isTetherMode?: boolean;
   fingerprint?: string;
   checksum?: string;
   // File object reference when sending
@@ -56,6 +57,7 @@ export interface TransferTask {
 export interface RoomConfig {
   roomId: string;
   encryptionMode: EncryptionMode;
+  isTetherMode: boolean;
   e2eEncryptionEnabled: boolean;
   soundEnabled: boolean;
   notificationsEnabled: boolean;

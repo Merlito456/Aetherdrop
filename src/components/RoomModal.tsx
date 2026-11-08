@@ -8,6 +8,8 @@ interface RoomModalProps {
   onSwitchRoom: (room: string) => void;
   encryptionMode?: 'turbo-dtls' | 'dual-crypto';
   onSwitchEncryptionMode?: (mode: 'turbo-dtls' | 'dual-crypto') => void;
+  isTetherMode?: boolean;
+  onSwitchTetherMode?: (enabled: boolean) => void;
 }
 
 export const RoomModal: React.FC<RoomModalProps> = ({
@@ -17,6 +19,8 @@ export const RoomModal: React.FC<RoomModalProps> = ({
   onSwitchRoom,
   encryptionMode = 'turbo-dtls',
   onSwitchEncryptionMode,
+  isTetherMode = false,
+  onSwitchTetherMode,
 }) => {
   const [roomInput, setRoomInput] = useState(currentRoom);
 
@@ -142,6 +146,35 @@ export const RoomModal: React.FC<RoomModalProps> = ({
                 </div>
               </label>
             </div>
+
+            {/* Direct Wi-Fi Tethering Boost Checkbox */}
+            <label className={`mt-2.5 p-2.5 rounded-xl border flex items-start gap-2.5 cursor-pointer transition-colors ${
+              isTetherMode
+                ? 'border-cyan-500 bg-cyan-50/70 dark:bg-cyan-950/40 text-cyan-900 dark:text-cyan-100'
+                : 'border-neutral-200 dark:border-neutral-800 hover:bg-neutral-50 dark:hover:bg-neutral-850'
+            }`}>
+              <input
+                type="checkbox"
+                checked={isTetherMode}
+                onChange={(e) => onSwitchTetherMode?.(e.target.checked)}
+                className="mt-0.5 w-4 h-4 rounded text-cyan-600 focus:ring-cyan-500 accent-cyan-500 cursor-pointer"
+              />
+              <div className="text-xs">
+                <div className="font-bold flex items-center gap-1.5 text-neutral-900 dark:text-neutral-100">
+                  <span>⚡ Wi-Fi Tethering / Mobile Hotspot Boost</span>
+                  <span className={`text-[10px] px-1.5 py-0.2 rounded font-bold ${
+                    isTetherMode
+                      ? 'bg-emerald-600 text-white'
+                      : 'bg-neutral-200 dark:bg-neutral-700 text-neutral-600 dark:text-neutral-400'
+                  }`}>
+                    {isTetherMode ? '1-Hop Active' : 'Off'}
+                  </span>
+                </div>
+                <p className="text-[11px] text-neutral-500 dark:text-neutral-400 mt-0.5 leading-snug">
+                  Use when client PC/laptop connects directly to sender's phone hotspot. Forces local host ICE routing and removes 20 Mbps cellular carrier ceiling.
+                </p>
+              </div>
+            </label>
           </div>
 
           <div className="flex items-center gap-2 pt-2">
