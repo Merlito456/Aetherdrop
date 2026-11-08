@@ -187,7 +187,17 @@ export default function App() {
         });
         setCurrentView('session');
       },
-      onTransferCompleted: () => {},
+      onTransferCompleted: (completedTask) => {
+        setTransfers((prev) => {
+          const index = prev.findIndex((t) => t.id === completedTask.id);
+          if (index === -1) {
+            return [completedTask, ...prev];
+          }
+          const copy = [...prev];
+          copy[index] = { ...completedTask };
+          return copy;
+        });
+      },
       onSignalingStatus: (status, msg) => {
         setSignalingStatus(status);
         if (msg) setSignalingMessage(msg);

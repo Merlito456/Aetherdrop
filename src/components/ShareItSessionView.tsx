@@ -61,7 +61,7 @@ export const ShareItSessionView: React.FC<ShareItSessionViewProps> = ({
   onTestTetherTransfer,
 }) => {
   const activeTransfers = transfers.filter(
-    (t) => t.status === 'transferring' || t.status === 'encrypting' || t.status === 'paused'
+    (t) => t.status === 'transferring' || t.status === 'encrypting' || t.status === 'paused' || t.status === 'connecting'
   );
   const completedTransfers = transfers.filter((t) => t.status === 'completed');
 

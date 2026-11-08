@@ -61,7 +61,8 @@ interface RelayTransfer {
   rawKey?: number[];
   chunks: Map<number, Buffer>;
   acknowledgedChunks: Set<number>;
-  completed: boolean;
+  senderCompleted: boolean;
+  receiverCompleted: boolean;
   lastActive: number;
 }
 
@@ -414,7 +415,8 @@ app.post('/api/relay/init', (req, res) => {
     rawKey,
     chunks: new Map(),
     acknowledgedChunks: new Set(),
-    completed: false,
+    senderCompleted: false,
+    receiverCompleted: false,
     lastActive: Date.now(),
   };
 
@@ -466,23 +468,27 @@ app.post('/api/relay/init', (req, res) => {
 // Endpoint for receivers to check if any active transfer is intended for them or their room
 app.get('/api/relay/active-for-peer', (req, res) => {
   const peerId = (req.query.peerId as string) || '';
-  const pin = (req.query.pin as string) || '';
-  const roomId = (req.query.roomId as string) || 'default-lan';
+  const pin = ((req.query.pin as string) || '').trim();
+  const roomId = ((req.query.roomId as string) || 'default-lan').toLowerCase().trim();
 
   const activeOffers: any[] = [];
   const now = Date.now();
 
   for (const [transferId, relay] of relayTransfers.entries()) {
-    if (relay.completed) continue;
-    if (now - relay.lastActive > 60000) continue;
+    // Only skip if the receiver has already finished downloading this transfer
+    if (relay.receiverCompleted) continue;
+    // Expire old uncollected transfers after 4 minutes
+    if (now - relay.lastActive > 240000) continue;
 
     // Check if this transfer is addressed to this peer
+    const relayRoom = (relay.roomId || 'default-lan').toLowerCase().trim();
+    const relayPin = (relay.targetPin || '').trim();
     const matchesTargetId = Boolean(peerId && relay.targetId === peerId);
-    const matchesTargetPin = Boolean(pin && relay.targetPin === pin);
-    const matchesRoomBroadcast = (!relay.targetId || relay.targetId === 'room') && relay.roomId === roomId;
-    const matchesRoom = relay.roomId === roomId;
+    const matchesTargetPin = Boolean(pin && relayPin && relayPin === pin);
+    const matchesRoom = relayRoom === roomId;
+    const isBroadcast = !relay.targetId || relay.targetId === 'room';
 
-    if (relay.senderId !== peerId && (matchesTargetId || matchesTargetPin || matchesRoomBroadcast || matchesRoom)) {
+    if (relay.senderId !== peerId && (matchesTargetId || matchesTargetPin || (isBroadcast && matchesRoom) || matchesRoom)) {
       const senderPeer = peers.get(relay.senderId);
       activeOffers.push({
         type: 'FILE_OFFER',
@@ -499,6 +505,7 @@ app.get('/api/relay/active-for-peer', (req, res) => {
         fingerprint: relay.fingerprint,
         rawKey: relay.rawKey,
         startedAt: relay.lastActive,
+        senderCompleted: Boolean(relay.senderCompleted),
       });
     }
   }
@@ -604,21 +611,13 @@ app.get('/api/relay/available-indices', (req, res) => {
   }
 
   relay.lastActive = Date.now();
-  const available: number[] = [];
   const chunkKeys = Array.from(relay.chunks.keys()).sort((a, b) => a - b);
-
-  for (const idx of chunkKeys) {
-    if (idx > afterIdx) {
-      available.push(idx);
-      if (available.length >= limit) break;
-    }
-  }
 
   res.json({
     transferId,
     totalChunks: relay.totalChunks,
-    completed: relay.completed,
-    indices: available,
+    senderCompleted: Boolean(relay.senderCompleted),
+    indices: chunkKeys,
   });
 });
 
@@ -659,7 +658,7 @@ app.get('/api/relay/pull', (req, res) => {
   res.json({
     transferId,
     totalChunks: relay.totalChunks,
-    completed: relay.completed,
+    senderCompleted: Boolean(relay.senderCompleted),
     chunks: available,
   });
 });
@@ -679,14 +678,29 @@ app.post('/api/relay/ack', (req, res) => {
   res.json({ ok: true });
 });
 
+// Sender calls complete when it finishes uploading all its chunks
 app.post('/api/relay/complete', (req, res) => {
   const { transferId } = req.body;
   if (transferId) {
     const relay = relayTransfers.get(transferId);
     if (relay) {
-      relay.completed = true;
+      relay.senderCompleted = true;
+      relay.lastActive = Date.now();
+      // Chunks are NOT deleted here so the receiver can download them
+    }
+  }
+  res.json({ ok: true });
+});
+
+// Receiver calls receiver-done when it has assembled the complete file
+app.post('/api/relay/receiver-done', (req, res) => {
+  const { transferId } = req.body;
+  if (transferId) {
+    const relay = relayTransfers.get(transferId);
+    if (relay) {
+      relay.receiverCompleted = true;
       relay.chunks.clear();
-      setTimeout(() => relayTransfers.delete(transferId), 5000);
+      setTimeout(() => relayTransfers.delete(transferId), 20000);
     }
   }
   res.json({ ok: true });

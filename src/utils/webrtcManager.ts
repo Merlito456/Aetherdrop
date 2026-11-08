@@ -1958,7 +1958,8 @@ export class WebRTCManager {
             }
           }
 
-          if (idxData.completed || task.bytesTransferred >= task.fileSize) {
+          const allChunksReceived = task.receivedChunks && task.receivedChunks.filter(Boolean).length >= (task.totalChunks || 1);
+          if (task.bytesTransferred >= task.fileSize || allChunksReceived) {
             completed = true;
             this.finalizeReceivedFile(task);
             return;
@@ -1997,7 +1998,8 @@ export class WebRTCManager {
               }).catch(() => {});
             }
 
-            if (data.completed || task.bytesTransferred >= task.fileSize) {
+            const allChunksReceived = task.receivedChunks && task.receivedChunks.filter(Boolean).length >= (task.totalChunks || 1);
+            if (task.bytesTransferred >= task.fileSize || allChunksReceived) {
               completed = true;
               this.finalizeReceivedFile(task);
               return;
@@ -2088,6 +2090,14 @@ export class WebRTCManager {
 
   private finalizeReceivedFile(task: TransferTask) {
     if (!task.receivedChunks || task.status === 'completed') return;
+
+    try {
+      fetch('/api/relay/receiver-done', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ transferId: task.id }),
+      }).catch(() => {});
+    } catch {}
 
     // Direct Blob instantiation without freezing CPU on redundant 1.5 GB SHA-256 calculation
     const blob = new Blob(task.receivedChunks as any, { type: task.mimeType });
