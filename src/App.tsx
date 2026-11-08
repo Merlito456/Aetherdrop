@@ -223,9 +223,21 @@ export default function App() {
     setCurrentView('receive-beacon');
   };
 
-  // Direct connect by PIN
-  const handleConnectByPin = (pin: string) => {
-    managerRef.current?.connectByPin(pin);
+  // Direct connect or transmit staged files by PIN
+  const handleConnectByPin = async (pin: string) => {
+    if (!pin) return;
+    if (stagedFilesToSend.length > 0) {
+      setCurrentView('session');
+      await managerRef.current?.sendFilesToPin(stagedFilesToSend, pin);
+    } else {
+      managerRef.current?.connectByPin(pin);
+    }
+  };
+
+  const handleTestTetherTransfer = async () => {
+    handleToggleTetherMode(true);
+    setCurrentView('session');
+    await managerRef.current?.testTetherTransfer();
   };
 
   // Handle scanned QR code
@@ -374,6 +386,7 @@ export default function App() {
             onToggleSimulatedPeer={handleToggleSimulatedPeer}
             isTetherMode={isTetherMode}
             onToggleTetherMode={handleToggleTetherMode}
+            onTestTetherTransfer={handleTestTetherTransfer}
           />
         )}
 
@@ -398,6 +411,7 @@ export default function App() {
             onConnectByPin={handleConnectByPin}
             signalingStatus={signalingStatus}
             signalingMessage={signalingMessage}
+            isTetherMode={isTetherMode}
           />
         )}
 
@@ -430,6 +444,7 @@ export default function App() {
             onRetry={handleRetry}
             onSendMore={handleStartSend}
             onExitSession={() => setCurrentView('home')}
+            onTestTetherTransfer={handleTestTetherTransfer}
           />
         )}
 

@@ -11,6 +11,7 @@ import {
   Sparkles,
   ArrowRight,
   History,
+  Zap,
 } from 'lucide-react';
 import { Peer } from '../types/transfer';
 
@@ -29,6 +30,7 @@ interface ShareItHomeProps {
   onToggleSimulatedPeer: (enable: boolean) => void;
   isTetherMode?: boolean;
   onToggleTetherMode?: (enabled: boolean) => void;
+  onTestTetherTransfer?: () => void;
 }
 
 export const ShareItHome: React.FC<ShareItHomeProps> = ({
@@ -45,6 +47,7 @@ export const ShareItHome: React.FC<ShareItHomeProps> = ({
   onToggleSimulatedPeer,
   isTetherMode = false,
   onToggleTetherMode,
+  onTestTetherTransfer,
 }) => {
   const getDeviceIcon = () => {
     switch (selfPeer.deviceType) {
@@ -122,11 +125,11 @@ export const ShareItHome: React.FC<ShareItHomeProps> = ({
       {/* Wi-Fi Tethering / Mobile Hotspot Quick-Enable Banner */}
       <div className={`p-4 rounded-2xl border transition-all ${
         isTetherMode
-          ? 'bg-cyan-50/70 dark:bg-cyan-950/40 border-cyan-400 dark:border-cyan-700 shadow-xs'
+          ? 'bg-cyan-50/80 dark:bg-cyan-950/40 border-cyan-400 dark:border-cyan-700 shadow-xs'
           : 'bg-white dark:bg-neutral-900 border-neutral-200 dark:border-neutral-800'
       }`}>
-        <label className="flex items-center justify-between gap-4 cursor-pointer select-none">
-          <div className="flex items-start sm:items-center gap-3 min-w-0">
+        <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+          <label className="flex items-start sm:items-center gap-3 cursor-pointer select-none min-w-0">
             <input
               type="checkbox"
               checked={isTetherMode}
@@ -135,8 +138,9 @@ export const ShareItHome: React.FC<ShareItHomeProps> = ({
             />
             <div className="min-w-0 text-left">
               <div className="flex items-center gap-2 flex-wrap">
-                <span className="text-xs sm:text-sm font-bold text-neutral-900 dark:text-neutral-100">
-                  ⚡ Wi-Fi Tethering / Mobile Hotspot Mode
+                <span className="text-xs sm:text-sm font-bold text-neutral-900 dark:text-neutral-100 flex items-center gap-1.5">
+                  <Zap className="w-4 h-4 text-cyan-500" />
+                  <span>Wi-Fi Tethering / Mobile Hotspot Boost</span>
                 </span>
                 <span className={`text-[10px] px-2 py-0.2 rounded-full font-bold ${
                   isTetherMode
@@ -147,16 +151,44 @@ export const ShareItHome: React.FC<ShareItHomeProps> = ({
                 </span>
               </div>
               <p className="text-[11px] text-neutral-500 dark:text-neutral-400 mt-0.5 leading-snug">
-                Direct local host connection with 4 parallel SCTP channels and 16 MB in-memory prefetch for maximum uncapped line rate.
+                Connect via phone personal hotspot with 4 parallel SCTP channels and zero-hang instant relay (50–120+ MB/s).
               </p>
             </div>
-          </div>
-          <div className="hidden sm:block text-right shrink-0">
-            <span className="text-xs font-mono font-bold text-cyan-600 dark:text-cyan-400">
+          </label>
+
+          <div className="flex items-center gap-2 shrink-0 self-end sm:self-center">
+            {onTestTetherTransfer && (
+              <button
+                type="button"
+                onClick={onTestTetherTransfer}
+                className="px-3 py-1.5 rounded-xl bg-cyan-600 hover:bg-cyan-500 text-white font-bold text-xs flex items-center gap-1.5 shadow-xs transition-colors cursor-pointer"
+                title="Immediately run benchmark tether file transfer"
+              >
+                <Zap className="w-3.5 h-3.5 fill-current" />
+                <span>Test Tether Transfer</span>
+              </button>
+            )}
+            <span className="text-xs font-mono font-bold text-cyan-600 dark:text-cyan-400 hidden md:inline">
               {isTetherMode ? '50–120+ MB/s' : '15–40 MB/s'}
             </span>
           </div>
-        </label>
+        </div>
+
+        {isTetherMode && (
+          <div className="mt-3 pt-3 border-t border-cyan-200/60 dark:border-cyan-800/60 flex flex-wrap items-center justify-between gap-2 text-[11px] text-cyan-900 dark:text-cyan-200">
+            <span className="flex items-center gap-1 font-medium">
+              <span>📱 Hotspot Setup:</span>
+              <span className="text-neutral-600 dark:text-neutral-400">1. Turn on Phone Hotspot</span>
+              <span aria-hidden="true">→</span>
+              <span className="text-neutral-600 dark:text-neutral-400">2. Connect second device to Wi-Fi</span>
+              <span aria-hidden="true">→</span>
+              <span className="text-neutral-600 dark:text-neutral-400">3. Tap SEND or RECEIVE</span>
+            </span>
+            <span className="font-mono font-bold text-emerald-600 dark:text-emerald-400">
+              1-Hop Ready
+            </span>
+          </div>
+        )}
       </div>
 
       {/* SHAREit Two Big Action Buttons */}

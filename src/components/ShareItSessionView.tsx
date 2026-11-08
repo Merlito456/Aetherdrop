@@ -38,6 +38,7 @@ interface ShareItSessionViewProps {
   onRetry?: (id: string) => void;
   onSendMore: () => void;
   onExitSession: () => void;
+  onTestTetherTransfer?: () => void;
 }
 
 export const ShareItSessionView: React.FC<ShareItSessionViewProps> = ({
@@ -53,6 +54,7 @@ export const ShareItSessionView: React.FC<ShareItSessionViewProps> = ({
   onRetry,
   onSendMore,
   onExitSession,
+  onTestTetherTransfer,
 }) => {
   const activeTransfers = transfers.filter(
     (t) => t.status === 'transferring' || t.status === 'encrypting' || t.status === 'paused'
@@ -272,9 +274,31 @@ export const ShareItSessionView: React.FC<ShareItSessionViewProps> = ({
           </span>
         </div>
 
-        <div className="divide-y divide-neutral-100 dark:divide-neutral-800/80">
-          {transfers.map((task) => (
-            <div key={task.id} className="py-3 flex flex-col gap-2">
+        {transfers.length === 0 ? (
+          <div className="py-10 text-center space-y-3">
+            <p className="text-xs text-neutral-500">No active files in this transfer session.</p>
+            <div className="flex flex-wrap items-center justify-center gap-2">
+              <button
+                onClick={onSendMore}
+                className="px-4 py-2 rounded-xl bg-cyan-600 hover:bg-cyan-500 text-white font-bold text-xs shadow-xs cursor-pointer"
+              >
+                Select Files to Send
+              </button>
+              {onTestTetherTransfer && (
+                <button
+                  onClick={onTestTetherTransfer}
+                  className="px-4 py-2 rounded-xl border border-cyan-500 text-cyan-600 dark:text-cyan-400 hover:bg-cyan-50 dark:hover:bg-cyan-950/50 font-bold text-xs flex items-center gap-1.5 shadow-xs cursor-pointer"
+                >
+                  <Zap className="w-3.5 h-3.5 fill-current" />
+                  <span>⚡ Test Tether Transfer</span>
+                </button>
+              )}
+            </div>
+          </div>
+        ) : (
+          <div className="divide-y divide-neutral-100 dark:divide-neutral-800/80">
+            {transfers.map((task) => (
+              <div key={task.id} className="py-3 flex flex-col gap-2">
               <div className="flex items-center justify-between gap-3">
                 <div className="flex items-center gap-3 min-w-0">
                   <div
@@ -315,11 +339,41 @@ export const ShareItSessionView: React.FC<ShareItSessionViewProps> = ({
                           <span>Tether 1-Hop</span>
                         </span>
                       )}
+                      {task.transportType && (
+                        <span
+                          title={`Transport: ${task.transportType}`}
+                          className={`flex items-center gap-1 text-[10px] font-mono px-1.5 py-0.5 rounded border ${
+                            task.transportType === 'webrtc-striped'
+                              ? 'text-cyan-700 dark:text-cyan-300 bg-cyan-50 dark:bg-cyan-950/60 border-cyan-300 dark:border-cyan-800'
+                              : task.transportType === 'relay-stream'
+                              ? 'text-amber-700 dark:text-amber-300 bg-amber-50 dark:bg-amber-950/60 border-amber-300 dark:border-amber-800'
+                              : 'text-indigo-700 dark:text-indigo-300 bg-indigo-50 dark:bg-indigo-950/60 border-indigo-300 dark:border-indigo-800'
+                          }`}
+                        >
+                          <span>
+                            {task.transportType === 'webrtc-striped'
+                              ? '4x SCTP'
+                              : task.transportType === 'relay-stream'
+                              ? 'Instant Relay'
+                              : task.transportType === 'broadcast-channel'
+                              ? 'Tab Direct'
+                              : 'WebRTC Direct'}
+                          </span>
+                        </span>
+                      )}
                     </div>
                     <div className="flex items-center gap-2 text-[11px] text-neutral-500 mt-0.5 flex-wrap">
                       <span>{task.direction === 'send' ? 'Sending' : 'Receiving'}</span>
                       <span aria-hidden="true">·</span>
                       <span className="font-mono tabular-nums">{formatBytes(task.fileSize)}</span>
+                      {task.status === 'connecting' && (
+                        <>
+                          <span aria-hidden="true">·</span>
+                          <span className="text-cyan-600 dark:text-cyan-400 font-semibold animate-pulse flex items-center gap-1">
+                            <span>Connecting direct line...</span>
+                          </span>
+                        </>
+                      )}
                       {task.status === 'transferring' && task.speed > 0 && (
                         <>
                           <span aria-hidden="true">·</span>
@@ -441,7 +495,8 @@ export const ShareItSessionView: React.FC<ShareItSessionViewProps> = ({
               </div>
             </div>
           ))}
-        </div>
+          </div>
+        )}
       </div>
     </div>
   );

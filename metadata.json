@@ -1,5 +1,5 @@
 {
-  "name": "Remix AetherDrop - Local P2P Encrypted File Transfer",
+  "name": "Remix Remix AetherDrop - Local P2P Encrypted File Transfer",
   "description": "Secure, high-speed peer-to-peer local Wi-Fi file sharing using WebRTC and AES-256-GCM encryption with real-time transfer tracking and zero local caching.",
   "requestFramePermissions": [],
   "majorCapabilities": [

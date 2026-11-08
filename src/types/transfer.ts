@@ -13,6 +13,7 @@ export interface Peer {
 }
 
 export type TransferStatus =
+  | 'connecting'
   | 'queued'
   | 'encrypting'
   | 'transferring'
@@ -22,6 +23,7 @@ export type TransferStatus =
   | 'error';
 
 export type EncryptionMode = 'turbo-dtls' | 'dual-crypto';
+export type TransportType = 'webrtc-striped' | 'webrtc-direct' | 'relay-stream' | 'broadcast-channel' | 'simulated';
 
 export interface TransferTask {
   id: string;
@@ -36,6 +38,7 @@ export interface TransferTask {
   speed: number; // bytes/sec
   peakSpeed?: number; // highest bytes/sec attained
   channelCount?: number; // active parallel SCTP stripes
+  transportType?: TransportType;
   eta: number; // seconds remaining
   status: TransferStatus;
   errorReason?: string;

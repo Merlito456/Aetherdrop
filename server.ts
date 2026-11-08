@@ -44,16 +44,40 @@ interface SignalMessage {
   timestamp: number;
 }
 
+interface RelayTransfer {
+  transferId: string;
+  senderId: string;
+  targetId: string;
+  fileName: string;
+  fileSize: number;
+  totalChunks: number;
+  mimeType: string;
+  encryptionMode: string;
+  isTetherMode: boolean;
+  fingerprint?: string;
+  rawKey?: number[];
+  chunks: Map<number, Buffer>;
+  acknowledgedChunks: Set<number>;
+  completed: boolean;
+  lastActive: number;
+}
+
 const peers = new Map<string, PeerInfo>();
 const messageQueues = new Map<string, SignalMessage[]>();
+const relayTransfers = new Map<string, RelayTransfer>();
 
-// Prune inactive peers every 15 seconds
+// Prune inactive peers & expired relay transfers
 setInterval(() => {
   const now = Date.now();
   for (const [id, peer] of peers.entries()) {
     if (now - peer.lastSeen > 25000) {
       peers.delete(id);
       messageQueues.delete(id);
+    }
+  }
+  for (const [xferId, xfer] of relayTransfers.entries()) {
+    if (now - xfer.lastActive > 45000) {
+      relayTransfers.delete(xferId);
     }
   }
 }, 10000);
@@ -172,6 +196,201 @@ app.post('/api/signal/leave', (req, res) => {
   if (id) {
     peers.delete(id);
     messageQueues.delete(id);
+  }
+  res.json({ ok: true });
+});
+
+// Direct Peer lookup by PIN
+app.get('/api/signal/peer-by-pin', (req, res) => {
+  const pin = req.query.pin as string;
+  if (!pin) {
+    res.status(400).json({ error: 'Missing PIN parameter' });
+    return;
+  }
+  const cleanPin = pin.trim();
+  const now = Date.now();
+  for (const peer of peers.values()) {
+    if (peer.pin === cleanPin && now - peer.lastSeen < 25000) {
+      res.json({
+        peer: {
+          id: peer.id,
+          pin: peer.pin,
+          name: peer.name,
+          deviceType: peer.deviceType,
+          browser: peer.browser,
+          avatarColor: peer.avatarColor,
+        },
+      });
+      return;
+    }
+  }
+  res.status(404).json({ error: 'Peer with PIN not found' });
+});
+
+// High-Speed Relay Stream Endpoints (Guaranteed fallback for tether/hotspot mDNS drop)
+app.post('/api/relay/init', (req, res) => {
+  const {
+    transferId,
+    senderId,
+    targetId,
+    fileName,
+    fileSize,
+    totalChunks,
+    mimeType,
+    encryptionMode,
+    isTetherMode,
+    fingerprint,
+    rawKey,
+  } = req.body;
+
+  if (!transferId || !senderId) {
+    res.status(400).json({ error: 'Missing required transfer fields' });
+    return;
+  }
+
+  const relay: RelayTransfer = {
+    transferId,
+    senderId,
+    targetId: targetId || '',
+    fileName: fileName || 'file',
+    fileSize: fileSize || 0,
+    totalChunks: totalChunks || 1,
+    mimeType: mimeType || 'application/octet-stream',
+    encryptionMode: encryptionMode || 'turbo-dtls',
+    isTetherMode: Boolean(isTetherMode),
+    fingerprint,
+    rawKey,
+    chunks: new Map(),
+    acknowledgedChunks: new Set(),
+    completed: false,
+    lastActive: Date.now(),
+  };
+
+  relayTransfers.set(transferId, relay);
+
+  // Notify target peer immediately through their message queue
+  if (targetId) {
+    const notifyMsg: SignalMessage = {
+      id: Math.random().toString(36).slice(2, 10),
+      senderId,
+      targetId,
+      type: 'FILE_OFFER_SIGNAL',
+      payload: {
+        type: 'FILE_OFFER',
+        transferId,
+        fileName,
+        fileSize,
+        mimeType,
+        totalChunks,
+        encryptionMode,
+        isTetherMode,
+        rawKey,
+        fingerprint,
+        viaRelay: true,
+      },
+      timestamp: Date.now(),
+    };
+    if (!messageQueues.has(targetId)) {
+      messageQueues.set(targetId, []);
+    }
+    messageQueues.get(targetId)!.push(notifyMsg);
+  }
+
+  res.json({ ok: true, transferId });
+});
+
+app.post(
+  '/api/relay/chunk',
+  express.raw({ type: '*/*', limit: '10mb' }),
+  (req, res) => {
+    const transferId = req.query.transferId as string;
+    const chunkIdx = parseInt(req.query.chunkIdx as string, 10);
+
+    if (!transferId || isNaN(chunkIdx)) {
+      res.status(400).json({ error: 'Missing transferId or chunkIdx' });
+      return;
+    }
+
+    const relay = relayTransfers.get(transferId);
+    if (!relay) {
+      res.status(404).json({ error: 'Relay transfer not found' });
+      return;
+    }
+
+    const bodyBuf = Buffer.isBuffer(req.body) ? req.body : Buffer.from(req.body);
+    relay.chunks.set(chunkIdx, bodyBuf);
+    relay.lastActive = Date.now();
+
+    res.json({ ok: true, chunkIdx });
+  }
+);
+
+app.get('/api/relay/pull', (req, res) => {
+  const transferId = req.query.transferId as string;
+  const afterIdx = parseInt((req.query.afterIdx as string) || '-1', 10);
+  const limit = Math.min(parseInt((req.query.limit as string) || '16', 10), 32);
+
+  if (!transferId) {
+    res.status(400).json({ error: 'Missing transferId' });
+    return;
+  }
+
+  const relay = relayTransfers.get(transferId);
+  if (!relay) {
+    res.status(404).json({ error: 'Relay transfer not found' });
+    return;
+  }
+
+  relay.lastActive = Date.now();
+
+  const available: Array<{ chunkIdx: number; data: string }> = [];
+  const chunkKeys = Array.from(relay.chunks.keys()).sort((a, b) => a - b);
+
+  for (const idx of chunkKeys) {
+    if (idx > afterIdx) {
+      const buf = relay.chunks.get(idx);
+      if (buf) {
+        available.push({
+          chunkIdx: idx,
+          data: buf.toString('base64'),
+        });
+        if (available.length >= limit) break;
+      }
+    }
+  }
+
+  res.json({
+    transferId,
+    totalChunks: relay.totalChunks,
+    completed: relay.completed,
+    chunks: available,
+  });
+});
+
+app.post('/api/relay/ack', (req, res) => {
+  const { transferId, chunkIndices } = req.body;
+  if (transferId && Array.isArray(chunkIndices)) {
+    const relay = relayTransfers.get(transferId);
+    if (relay) {
+      relay.lastActive = Date.now();
+      for (const idx of chunkIndices) {
+        relay.chunks.delete(idx);
+        relay.acknowledgedChunks.add(idx);
+      }
+    }
+  }
+  res.json({ ok: true });
+});
+
+app.post('/api/relay/complete', (req, res) => {
+  const { transferId } = req.body;
+  if (transferId) {
+    const relay = relayTransfers.get(transferId);
+    if (relay) {
+      relay.completed = true;
+      relay.chunks.clear();
+      setTimeout(() => relayTransfers.delete(transferId), 5000);
+    }
   }
   res.json({ ok: true });
 });

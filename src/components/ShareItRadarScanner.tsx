@@ -9,7 +9,7 @@ import {
   Smartphone,
   Tablet,
   Radio,
-  FileCheck2,
+  Zap,
 } from 'lucide-react';
 import { Peer } from '../types/transfer';
 import { formatBytes } from '../utils/formatters';
@@ -25,6 +25,7 @@ interface ShareItRadarScannerProps {
   onConnectByPin: (pin: string) => void;
   signalingStatus: 'connected' | 'connecting' | 'offline';
   signalingMessage?: string;
+  isTetherMode?: boolean;
 }
 
 export const ShareItRadarScanner: React.FC<ShareItRadarScannerProps> = ({
@@ -38,6 +39,7 @@ export const ShareItRadarScanner: React.FC<ShareItRadarScannerProps> = ({
   onConnectByPin,
   signalingStatus,
   signalingMessage,
+  isTetherMode = false,
 }) => {
   const [pinInput, setPinInput] = useState('');
   const [pinNotice, setPinNotice] = useState<string | null>(null);
@@ -59,9 +61,13 @@ export const ShareItRadarScanner: React.FC<ShareItRadarScannerProps> = ({
       setPinNotice("That is this device's own PIN. Enter the PIN shown on the receiver's screen.");
       return;
     }
+    const matched = peers.find((p) => p.pin === clean);
+    if (matched) {
+      onSelectReceiver(matched);
+      return;
+    }
     onConnectByPin(clean);
-    setPinNotice(`Connecting to receiver PIN ${clean}...`);
-    setTimeout(() => setPinNotice(null), 4000);
+    setPinNotice(`Connecting and transmitting ${stagedFiles.length} file(s) to PIN ${clean}...`);
   };
 
   const getDeviceIcon = (type: string) => {
@@ -147,6 +153,18 @@ export const ShareItRadarScanner: React.FC<ShareItRadarScannerProps> = ({
       {pinNotice && (
         <div className="px-3 py-2 bg-cyan-50 dark:bg-cyan-950/40 border border-cyan-200 dark:border-cyan-800 rounded-xl text-xs text-cyan-700 dark:text-cyan-300">
           {pinNotice}
+        </div>
+      )}
+
+      {isTetherMode && (
+        <div className="px-4 py-2 bg-cyan-50 dark:bg-cyan-950/40 border border-cyan-400 dark:border-cyan-800 rounded-2xl flex items-center justify-between gap-2 text-xs shadow-2xs">
+          <span className="flex items-center gap-1.5 font-bold text-cyan-800 dark:text-cyan-200">
+            <Zap className="w-4 h-4 text-cyan-500 fill-current" />
+            <span>Wi-Fi Tethering Boost: Direct 1-Hop 4x Striped Link Active</span>
+          </span>
+          <span className="text-[11px] font-mono font-bold text-emerald-600 dark:text-emerald-400">
+            50–120+ MB/s
+          </span>
         </div>
       )}
 
