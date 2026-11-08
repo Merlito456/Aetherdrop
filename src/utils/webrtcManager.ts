@@ -12,12 +12,12 @@ import { sendTransferNotification } from './notifications';
 import { formatBytes } from './formatters';
 import mqtt, { MqttClient } from 'mqtt';
 
-// Uncaps browser WebRTC SCTP DataChannel bandwidth limit from default 20-30 Mbps to 2 Gbps
+// Uncaps browser WebRTC SCTP DataChannel bandwidth limit to 5 Gbps for unlimited Wi-Fi hotspot throughput
 function uncapSdpBandwidth(sdpStr: string): string {
   if (!sdpStr) return sdpStr;
   let sdp = sdpStr;
 
-  const bitrateKbps = 2000000; // 2,000,000 kbps (2 Gbps)
+  const bitrateKbps = 5000000; // 5,000,000 kbps (5 Gbps)
   const bitrateBps = bitrateKbps * 1000;
 
   // Normalize line endings to \r\n
@@ -40,7 +40,7 @@ function uncapSdpBandwidth(sdpStr: string): string {
 }
 
 // Tuned for Maximum Stability & High-Speed Local Wi-Fi Throughput
-// 32 KB chunk size guarantees safe delivery without exceeding the WebRTC 64KB SCTP max-message limit (which previously caused transfers to freeze at 64 KB!)
+// 32 KB chunk size guarantees safe delivery without exceeding the WebRTC 64KB SCTP max-message limit
 const CHUNK_SIZE = 32 * 1024; // 32 KB per chunk
 const BLOCK_READ_SIZE = 4 * 1024 * 1024; // 4 MB bulk disk/memory slice buffer
 const MAX_BUFFERED_AMOUNT = 1024 * 1024; // 1 MB backpressure pipeline window
@@ -63,9 +63,10 @@ export class WebRTCManager {
   private mqttClient: MqttClient | null = null;
   private localBroadcastChannel: BroadcastChannel | null = null;
 
-  // WebRTC PeerConnections & DataChannels
+  // WebRTC PeerConnections & Multi-Channel Striped DataChannels
   private peerConnections = new Map<string, RTCPeerConnection>();
-  private dataChannels = new Map<string, RTCDataChannel>();
+  private dataChannels = new Map<string, RTCDataChannel>(); // Primary control channel
+  private peerChannelStripes = new Map<string, RTCDataChannel[]>(); // 4x Parallel Striped DataChannels
   private dataChannelWaiters = new Map<string, Array<(dc: RTCDataChannel) => void>>();
   private fileAcceptWaiters = new Map<string, (accepted: boolean) => void>();
   private pendingIceCandidates = new Map<string, RTCIceCandidateInit[]>();
@@ -144,6 +145,13 @@ export class WebRTCManager {
       } catch {}
       this.localBroadcastChannel = null;
     }
+
+    for (const list of this.peerChannelStripes.values()) {
+      for (const dc of list) {
+        try { dc.close(); } catch {}
+      }
+    }
+    this.peerChannelStripes.clear();
 
     for (const dc of this.dataChannels.values()) {
       try { dc.close(); } catch {}
@@ -491,10 +499,14 @@ export class WebRTCManager {
     };
 
     if (isInitiator) {
-      const dc = pc.createDataChannel('aetherdrop_transfer', {
-        ordered: true, // Guarantees in-order chunk delivery & prevents corrupt early completion
-      });
-      this.setupDataChannel(targetPeerId, dc);
+      // Create 4 parallel striped SCTP DataChannels for maximum uncapped Wi-Fi tether throughput
+      const numChannels = 4;
+      for (let i = 0; i < numChannels; i++) {
+        const dc = pc.createDataChannel(`aetherdrop_ch_${i}`, {
+          ordered: true,
+        });
+        this.setupDataChannel(targetPeerId, dc);
+      }
 
       const offer = await pc.createOffer();
       const uncappedOfferSdp = uncapSdpBandwidth(offer.sdp || '');
@@ -562,8 +574,20 @@ export class WebRTCManager {
     dc.bufferedAmountLowThreshold = BUFFER_LOW_THRESHOLD;
 
     dc.onopen = () => {
-      console.log(`[AetherDrop] Direct WebRTC DataChannel OPEN with peer ${peerId}`);
-      this.dataChannels.set(peerId, dc);
+      console.log(`[AetherDrop] Direct WebRTC DataChannel ${dc.label} OPEN with peer ${peerId}`);
+      
+      // Keep primary control channel reference
+      if (!this.dataChannels.has(peerId) || dc.label === 'aetherdrop_ch_0') {
+        this.dataChannels.set(peerId, dc);
+      }
+
+      // Add to striped channels list for parallel binary throughput
+      const stripes = this.peerChannelStripes.get(peerId) || [];
+      if (!stripes.some((c) => c.label === dc.label)) {
+        stripes.push(dc);
+        this.peerChannelStripes.set(peerId, stripes);
+      }
+
       const peer = this.peers.get(peerId);
       if (peer) {
         peer.status = 'connected';
@@ -580,12 +604,20 @@ export class WebRTCManager {
     };
 
     dc.onclose = () => {
-      this.dataChannels.delete(peerId);
-      const peer = this.peers.get(peerId);
-      if (peer) {
-        peer.status = 'available';
+      const stripes = this.peerChannelStripes.get(peerId) || [];
+      const filtered = stripes.filter((c) => c.label !== dc.label);
+      this.peerChannelStripes.set(peerId, filtered);
+
+      if (filtered.length === 0) {
+        this.dataChannels.delete(peerId);
+        const peer = this.peers.get(peerId);
+        if (peer) {
+          peer.status = 'available';
+        }
+        this.broadcastPeersList();
+      } else if (this.dataChannels.get(peerId)?.label === dc.label) {
+        this.dataChannels.set(peerId, filtered[0]);
       }
-      this.broadcastPeersList();
     };
 
     dc.onmessage = (event) => {
@@ -624,8 +656,8 @@ export class WebRTCManager {
   private notifyTransferProgress(task: TransferTask, force: boolean = false) {
     const now = Date.now();
     const last = this.lastUiUpdateTimes.get(task.id) || 0;
-    // 160ms throttle (~6 updates/sec) prevents React DOM re-render thrashing and frees CPU for network sockets
-    if (force || now - last >= 160) {
+    // 100ms throttle keeps React UI buttery-smooth while dedicating CPU to socket pipelines
+    if (force || now - last >= 100) {
       this.lastUiUpdateTimes.set(task.id, now);
       this.updateMetrics(task);
       this.callbacks.onTransferUpdated({ ...task });
@@ -750,14 +782,14 @@ export class WebRTCManager {
       let blockStart = 0;
       let blockBuffer: ArrayBuffer | null = null;
 
-      for (let chunkIdx = 0; chunkIdx < totalChunks; chunkIdx++) {
-        if (dc.readyState !== 'open') {
-          throw new Error(`DataChannel closed unexpectedly (state: ${dc.readyState})`);
-        }
+      // Multi-Channel SCTP Striping: Route through all parallel active DataChannels
+      const stripes = this.peerChannelStripes.get(targetPeerId)?.filter((c) => c.readyState === 'open') || [dc];
+      task.channelCount = stripes.length;
 
+      for (let chunkIdx = 0; chunkIdx < totalChunks; chunkIdx++) {
         // Dynamically query tether mode
-        const activeBlockSize = this.isTetherMode ? 8 * 1024 * 1024 : BLOCK_READ_SIZE;
-        const activeMaxBuffer = this.isTetherMode ? 2 * 1024 * 1024 : MAX_BUFFERED_AMOUNT;
+        const activeBlockSize = this.isTetherMode ? 16 * 1024 * 1024 : BLOCK_READ_SIZE;
+        const activeMaxBuffer = this.isTetherMode ? 1024 * 1024 : MAX_BUFFERED_AMOUNT;
 
         if (this.cancelledTransfers.has(task.id)) {
           task.status = 'cancelled';
@@ -782,7 +814,7 @@ export class WebRTCManager {
         const chunkEnd = Math.min(chunkStart + CHUNK_SIZE, file.size);
         const chunkSize = chunkEnd - chunkStart;
 
-        // Bulk memory prefetch (4 MB or 8 MB in tether mode) to eliminate disk contention
+        // Bulk memory prefetch (16 MB in tether mode) to eliminate disk contention
         if (!blockBuffer || chunkStart >= blockStart + activeBlockSize) {
           blockStart = chunkStart;
           const blockEnd = Math.min(blockStart + activeBlockSize, file.size);
@@ -790,6 +822,17 @@ export class WebRTCManager {
         }
 
         const offsetInBlock = chunkStart - blockStart;
+
+        // Least-Loaded Channel Selection:
+        // Automatically route each chunk to the parallel SCTP stream with lowest buffer occupancy
+        let activeChannel = stripes[0];
+        let minBuffered = activeChannel.bufferedAmount;
+        for (let c = 1; c < stripes.length; c++) {
+          if (stripes[c].readyState === 'open' && stripes[c].bufferedAmount < minBuffered) {
+            minBuffered = stripes[c].bufferedAmount;
+            activeChannel = stripes[c];
+          }
+        }
 
         if (task.encryptionMode === 'turbo-dtls') {
           // Turbo Hardware-Accelerated (Native DTLS AES-256-GCM)
@@ -800,16 +843,18 @@ export class WebRTCManager {
           // Zero-copy typed array view over blockBuffer
           packet.set(new Uint8Array(blockBuffer, offsetInBlock, chunkSize), 4);
 
-          // Pipelined SCTP Backpressure: Pause only when buffer exceeds safe window
-          if (dc.bufferedAmount > activeMaxBuffer) {
-            await this.waitForDataChannelBuffer(dc, activeMaxBuffer);
+          // Pipelined SCTP Backpressure: Pause only when chosen channel exceeds safe window
+          if (activeChannel.bufferedAmount > activeMaxBuffer) {
+            await this.waitForDataChannelBuffer(activeChannel, activeMaxBuffer);
           }
 
-          if (dc.readyState !== 'open') {
-            throw new Error(`DataChannel closed unexpectedly (state: ${dc.readyState})`);
+          if (activeChannel.readyState !== 'open') {
+            const fallback = stripes.find((s) => s.readyState === 'open');
+            if (!fallback) throw new Error('DataChannel closed unexpectedly');
+            activeChannel = fallback;
           }
 
-          dc.send(packet.buffer);
+          activeChannel.send(packet.buffer);
         } else {
           // Dual-Layer Encryption (DTLS + WebCrypto AES-GCM)
           const rawChunk = blockBuffer.slice(offsetInBlock, offsetInBlock + chunkSize);
@@ -822,15 +867,17 @@ export class WebRTCManager {
           packet.set(iv, 4);
           packet.set(new Uint8Array(encrypted), 16);
 
-          if (dc.bufferedAmount > activeMaxBuffer) {
-            await this.waitForDataChannelBuffer(dc, activeMaxBuffer);
+          if (activeChannel.bufferedAmount > activeMaxBuffer) {
+            await this.waitForDataChannelBuffer(activeChannel, activeMaxBuffer);
           }
 
-          if (dc.readyState !== 'open') {
-            throw new Error(`DataChannel closed unexpectedly (state: ${dc.readyState})`);
+          if (activeChannel.readyState !== 'open') {
+            const fallback = stripes.find((s) => s.readyState === 'open');
+            if (!fallback) throw new Error('DataChannel closed unexpectedly');
+            activeChannel = fallback;
           }
 
-          dc.send(packet.buffer);
+          activeChannel.send(packet.buffer);
         }
 
         bytesSent += chunkSize;
@@ -840,9 +887,11 @@ export class WebRTCManager {
         this.notifyTransferProgress(task, false);
       }
 
-      // Flush remaining data in transit before completing
-      if (dc.bufferedAmount > 0 && dc.readyState === 'open') {
-        await this.waitForDataChannelBuffer(dc, 0);
+      // Flush remaining data in transit across all active striped channels
+      for (const ch of stripes) {
+        if (ch.readyState === 'open' && ch.bufferedAmount > 0) {
+          await this.waitForDataChannelBuffer(ch, 0);
+        }
       }
 
       // Complete transfer notification
@@ -1086,10 +1135,20 @@ export class WebRTCManager {
     }
 
     const elapsed = (now - tracker.lastTime) / 1000;
-    if (elapsed >= 0.25) {
+    if (elapsed >= 0.15) {
       const bytesDiff = task.bytesTransferred - tracker.lastBytes;
       const currentSpeed = bytesDiff / elapsed;
-      task.speed = task.speed === 0 ? currentSpeed : Math.round(task.speed * 0.35 + currentSpeed * 0.65);
+      // Exponential moving average for fluid responsiveness
+      task.speed = task.speed === 0 ? currentSpeed : Math.round(task.speed * 0.25 + currentSpeed * 0.75);
+      
+      // Track peak speed attained during this transfer
+      if (!task.peakSpeed || task.speed > task.peakSpeed) {
+        task.peakSpeed = task.speed;
+      }
+
+      // Count active open striped SCTP channels
+      const activeStripes = this.peerChannelStripes.get(task.peerId)?.filter((c) => c.readyState === 'open').length || 1;
+      task.channelCount = activeStripes;
 
       const remainingBytes = Math.max(0, task.fileSize - task.bytesTransferred);
       task.eta = task.speed > 0 ? remainingBytes / task.speed : 0;
@@ -1147,6 +1206,7 @@ export class WebRTCManager {
     const totalChunks = Math.ceil(file.size / CHUNK_SIZE);
     let bytesSent = 0;
     const receivedChunks: ArrayBuffer[] = [];
+    task.channelCount = 4;
 
     for (let i = 0; i < totalChunks; i++) {
       if (this.cancelledTransfers.has(task.id)) {

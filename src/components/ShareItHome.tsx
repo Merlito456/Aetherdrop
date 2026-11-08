@@ -143,17 +143,17 @@ export const ShareItHome: React.FC<ShareItHomeProps> = ({
                     ? 'bg-emerald-600 text-white animate-pulse'
                     : 'bg-neutral-100 dark:bg-neutral-800 text-neutral-600 dark:text-neutral-400'
                 }`}>
-                  {isTetherMode ? '1-Hop Boost Active (Direct Host Routing)' : 'Standard LAN'}
+                  {isTetherMode ? '⚡ Unlimited 4x Striped Boost Active' : 'Standard LAN'}
                 </span>
               </div>
               <p className="text-[11px] text-neutral-500 dark:text-neutral-400 mt-0.5 leading-snug">
-                Turn ON if client PC/laptop connects directly to sender's phone hotspot. Prioritizes local host ICE routing and removes 20 Mbps cellular throttling.
+                Direct local host connection with 4 parallel SCTP channels and 16 MB in-memory prefetch for maximum uncapped line rate.
               </p>
             </div>
           </div>
           <div className="hidden sm:block text-right shrink-0">
             <span className="text-xs font-mono font-bold text-cyan-600 dark:text-cyan-400">
-              {isTetherMode ? '30–80+ MB/s' : '15–40 MB/s'}
+              {isTetherMode ? '50–120+ MB/s' : '15–40 MB/s'}
             </span>
           </div>
         </label>

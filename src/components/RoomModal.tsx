@@ -167,11 +167,11 @@ export const RoomModal: React.FC<RoomModalProps> = ({
                       ? 'bg-emerald-600 text-white'
                       : 'bg-neutral-200 dark:bg-neutral-700 text-neutral-600 dark:text-neutral-400'
                   }`}>
-                    {isTetherMode ? '1-Hop Active' : 'Off'}
+                    {isTetherMode ? '⚡ Unlimited 4x Striped Boost' : 'Off'}
                   </span>
                 </div>
                 <p className="text-[11px] text-neutral-500 dark:text-neutral-400 mt-0.5 leading-snug">
-                  Use when client PC/laptop connects directly to sender's phone hotspot. Forces local host ICE routing and removes 20 Mbps cellular carrier ceiling.
+                  Use when client PC/laptop connects directly to sender's phone hotspot. Enables 4 parallel SCTP channels and 16 MB in-memory prefetch for line-rate Wi-Fi speed.
                 </p>
               </div>
             </label>

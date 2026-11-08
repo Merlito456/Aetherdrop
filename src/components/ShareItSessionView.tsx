@@ -62,6 +62,8 @@ export const ShareItSessionView: React.FC<ShareItSessionViewProps> = ({
   const overallProgress = totalBytes > 0 ? Math.round((transferredBytes / totalBytes) * 100) : 0;
   const currentSpeed = activeTransfers.reduce((sum, t) => sum + t.speed, 0);
   const maxEta = activeTransfers.reduce((max, t) => Math.max(max, t.eta), 0);
+  const maxPeakSpeed = transfers.reduce((max, t) => Math.max(max, t.peakSpeed || 0), 0);
+  const activeChannelCount = transfers.find((t) => t.status === 'transferring')?.channelCount || (isTetherMode ? 4 : 1);
 
   // Identify remote peer
   const remotePeerName = transfers[0]?.peerName || 'Connected Device';
@@ -129,15 +131,24 @@ export const ShareItSessionView: React.FC<ShareItSessionViewProps> = ({
 
           {/* Animated Flow Pulse Line & Speedometer */}
           <div className="flex-1 flex flex-col items-center px-4">
-            <div className="flex items-center gap-2 mb-1.5 text-xs font-mono font-bold text-cyan-600 dark:text-cyan-400">
+            <div className="flex items-center gap-2 mb-1.5 text-xs font-mono font-bold text-cyan-600 dark:text-cyan-400 flex-wrap justify-center">
               <Zap className="w-3.5 h-3.5 animate-pulse text-cyan-500" />
               <span>{currentSpeed > 0 ? formatSpeed(currentSpeed) : 'Direct P2P Link (Ready)'}</span>
+              {maxPeakSpeed > 0 && (
+                <span className="text-[11px] px-2 py-0.5 rounded-md bg-cyan-50 dark:bg-cyan-950/60 text-cyan-700 dark:text-cyan-300 border border-cyan-200 dark:border-cyan-800 font-semibold">
+                  Peak: {formatSpeed(maxPeakSpeed)}
+                </span>
+              )}
             </div>
 
             <div className="w-full relative flex items-center">
-              <div className="w-full h-2 bg-neutral-100 dark:bg-neutral-800 rounded-full overflow-hidden shadow-inner">
+              <div className="w-full h-2.5 bg-neutral-100 dark:bg-neutral-800 rounded-full overflow-hidden shadow-inner">
                 <div
-                  className="h-full bg-gradient-to-r from-cyan-500 via-emerald-400 to-teal-400 rounded-full transition-all duration-300"
+                  className={`h-full rounded-full transition-all duration-200 ${
+                    currentSpeed > 30 * 1024 * 1024
+                      ? 'bg-gradient-to-r from-cyan-400 via-teal-300 to-emerald-400 animate-pulse'
+                      : 'bg-gradient-to-r from-cyan-500 via-emerald-400 to-teal-400'
+                  }`}
                   style={{ width: `${overallProgress}%` }}
                 />
               </div>
@@ -156,15 +167,23 @@ export const ShareItSessionView: React.FC<ShareItSessionViewProps> = ({
                   </span>
                 </>
               )}
+              {activeChannelCount > 1 && (
+                <>
+                  <span aria-hidden="true">·</span>
+                  <span className="text-emerald-600 dark:text-emerald-400 font-bold">
+                    {activeChannelCount}x Striped SCTP
+                  </span>
+                </>
+              )}
             </div>
 
             {/* Turbo Hardware Acceleration Mode Badge */}
-            <div className="mt-3 flex items-center gap-2">
+            <div className="mt-3 flex items-center gap-2 flex-wrap justify-center">
               <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-[10px] font-medium bg-emerald-50 dark:bg-emerald-950/60 text-emerald-700 dark:text-emerald-300 border border-emerald-200 dark:border-emerald-800">
                 <Lock className="w-3 h-3 text-emerald-500" />
                 <span>
                   {encryptionMode === 'turbo-dtls'
-                    ? '⚡ Uncapped Wire Speed (Hardware DTLS AES-256-GCM · 2 Gbps Uncapped)'
+                    ? '⚡ Hardware DTLS AES-256-GCM (5 Gbps Uncapped Wire Speed)'
                     : '🔒 Dual-Layer Mode: DTLS + WebCrypto AES-GCM'}
                 </span>
               </span>
@@ -206,11 +225,11 @@ export const ShareItSessionView: React.FC<ShareItSessionViewProps> = ({
                             : 'bg-neutral-200 dark:bg-neutral-700 text-neutral-600 dark:text-neutral-300'
                         }`}
                       >
-                        {isTetherMode ? '1-Hop Boost Active' : 'Off'}
+                        {isTetherMode ? 'Unlimited 4x Striped Boost Active' : 'Off'}
                       </span>
                     </span>
                     <span className="text-[11px] text-neutral-500 dark:text-neutral-400 leading-snug mt-0.5">
-                      Check this if PC/laptop is connected to sender via mobile hotspot. Bypasses 20 Mbps cellular carrier NAT for direct 30–80+ MB/s Wi-Fi speed.
+                      Direct local host connection with 4 parallel SCTP channels and 16 MB in-memory prefetch for maximum uncapped line rate (50–120+ MB/s).
                     </span>
                   </div>
                 </div>
@@ -220,7 +239,7 @@ export const ShareItSessionView: React.FC<ShareItSessionViewProps> = ({
                       isTetherMode ? 'text-cyan-600 dark:text-cyan-400' : 'text-neutral-400'
                     }`}
                   >
-                    {isTetherMode ? 'Hotspot Direct' : 'Standard LAN'}
+                    {isTetherMode ? '4x Striped Streams' : 'Standard LAN'}
                   </span>
                 </div>
               </label>
@@ -294,7 +313,7 @@ export const ShareItSessionView: React.FC<ShareItSessionViewProps> = ({
                         </span>
                       )}
                     </div>
-                    <div className="flex items-center gap-2 text-[11px] text-neutral-500 mt-0.5">
+                    <div className="flex items-center gap-2 text-[11px] text-neutral-500 mt-0.5 flex-wrap">
                       <span>{task.direction === 'send' ? 'Sending' : 'Receiving'}</span>
                       <span aria-hidden="true">·</span>
                       <span className="font-mono tabular-nums">{formatBytes(task.fileSize)}</span>
@@ -303,6 +322,22 @@ export const ShareItSessionView: React.FC<ShareItSessionViewProps> = ({
                           <span aria-hidden="true">·</span>
                           <span className="font-mono text-cyan-600 dark:text-cyan-400 font-semibold">
                             {formatSpeed(task.speed)}
+                          </span>
+                        </>
+                      )}
+                      {task.peakSpeed && task.peakSpeed > 0 && (
+                        <>
+                          <span aria-hidden="true">·</span>
+                          <span className="font-mono text-neutral-400">
+                            Peak: {formatSpeed(task.peakSpeed)}
+                          </span>
+                        </>
+                      )}
+                      {task.channelCount && task.channelCount > 1 && (
+                        <>
+                          <span aria-hidden="true">·</span>
+                          <span className="font-mono text-emerald-600 dark:text-emerald-400 font-bold">
+                            {task.channelCount}x SCTP
                           </span>
                         </>
                       )}

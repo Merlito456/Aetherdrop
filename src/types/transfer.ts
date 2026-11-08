@@ -34,6 +34,8 @@ export interface TransferTask {
   bytesTransferred: number;
   progress: number; // 0 - 100
   speed: number; // bytes/sec
+  peakSpeed?: number; // highest bytes/sec attained
+  channelCount?: number; // active parallel SCTP stripes
   eta: number; // seconds remaining
   status: TransferStatus;
   errorReason?: string;
