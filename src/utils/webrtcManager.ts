@@ -566,6 +566,11 @@ export class WebRTCManager {
     if (existing && existing.readyState === 'open') {
       return Promise.resolve(existing);
     }
+    const stripeOpen = this.peerChannelStripes.get(targetPeerId)?.find((c) => c.readyState === 'open');
+    if (stripeOpen) {
+      this.dataChannels.set(targetPeerId, stripeOpen);
+      return Promise.resolve(stripeOpen);
+    }
 
     return new Promise((resolve, reject) => {
       // Extended 25-second timeout with informative error message
@@ -613,11 +618,13 @@ export class WebRTCManager {
     return new Promise<void>((resolve) => {
       let resolved = false;
       let pollInterval: any = null;
+      let safetyTimer: any = null;
 
       const finish = () => {
         if (!resolved) {
           resolved = true;
           if (pollInterval) clearInterval(pollInterval);
+          if (safetyTimer) clearTimeout(safetyTimer);
           dc.removeEventListener('bufferedamountlow', finish);
           dc.removeEventListener('close', finish);
           dc.removeEventListener('error', finish);
@@ -629,12 +636,19 @@ export class WebRTCManager {
       dc.addEventListener('close', finish, { once: true });
       dc.addEventListener('error', finish, { once: true });
 
-      // Fallback polling every 10ms to ensure continuous data flow
+      // Poll every 8ms: check if buffer has drained below maxBuffered or low threshold
       pollInterval = setInterval(() => {
-        if (dc.bufferedAmount <= (dc.bufferedAmountLowThreshold || BUFFER_LOW_THRESHOLD) || dc.readyState !== 'open') {
+        if (
+          dc.bufferedAmount <= maxBuffered ||
+          dc.bufferedAmount <= (dc.bufferedAmountLowThreshold || BUFFER_LOW_THRESHOLD) ||
+          dc.readyState !== 'open'
+        ) {
           finish();
         }
-      }, 10);
+      }, 8);
+
+      // Max wait 1500ms safety timeout: prevents pipeline from permanently locking up
+      safetyTimer = setTimeout(finish, 1500);
     });
   }
 
@@ -645,14 +659,6 @@ export class WebRTCManager {
 
     const existingPc = this.peerConnections.get(targetPeerId);
     if (existingPc) {
-      // If already in flight, don't destroy connection unless it has failed or closed
-      if (
-        (existingPc.signalingState === 'have-local-offer' || existingPc.connectionState === 'connecting') &&
-        existingPc.connectionState !== 'failed' &&
-        existingPc.connectionState !== 'closed'
-      ) {
-        return;
-      }
       try { existingPc.close(); } catch {}
       this.peerConnections.delete(targetPeerId);
     }
@@ -689,6 +695,11 @@ export class WebRTCManager {
       }
     };
 
+    // ALWAYS hook up ondatachannel on both sides
+    pc.ondatachannel = (event) => {
+      this.setupDataChannel(targetPeerId, event.channel);
+    };
+
     if (isInitiator) {
       // Create 4 parallel striped SCTP DataChannels for maximum uncapped Wi-Fi tether throughput
       const numChannels = 4;
@@ -708,67 +719,59 @@ export class WebRTCManager {
         type: 'OFFER',
         sdp: desc,
       });
-    } else {
-      pc.ondatachannel = (event) => {
-        this.setupDataChannel(targetPeerId, event.channel);
-      };
     }
   }
 
   private async handleWebRTCOffer(senderId: string, sdp: RTCSessionDescriptionInit) {
     let pc = this.peerConnections.get(senderId);
-    const isPolite = this.selfPeer.id.localeCompare(senderId) > 0;
 
-    if (pc) {
-      // Glare Collision Handling (Perfect Negotiation)
-      if (pc.signalingState !== 'stable') {
-        if (!isPolite) {
-          console.log('[AetherDrop] Glare collision: Impolite peer ignoring duplicate incoming offer');
-          return;
-        }
-        console.log('[AetherDrop] Glare collision: Polite peer rolling back to handle remote offer');
-        try {
-          await pc.setLocalDescription({ type: 'rollback' });
-        } catch (e) {
-          console.warn('Rollback failed:', e);
-        }
-      }
-    } else {
-      const iceServers = [
-        { urls: 'stun:stun.l.google.com:19302' },
-        { urls: 'stun:stun1.l.google.com:19302' },
-        { urls: 'stun:stun.cloudflare.com:3478' },
-        { urls: 'stun:stun.services.mozilla.com' },
-      ];
-
-      pc = new RTCPeerConnection({
-        iceServers,
-        iceCandidatePoolSize: 10,
-      });
-      this.peerConnections.set(senderId, pc);
-
-      pc.oniceconnectionstatechange = () => {
-        console.log(`[AetherDrop] Receiver ICE state with ${senderId}:`, pc!.iceConnectionState);
-        if (pc!.iceConnectionState === 'failed') {
-          try { pc!.restartIce(); } catch {}
-        }
-      };
-
-      pc.onicecandidate = (event) => {
-        if (event.candidate) {
-          this.sendSignalingMessage({ peerId: senderId }, {
-            type: 'ICE_CANDIDATE',
-            candidate: event.candidate,
-            isHost: event.candidate.candidate?.includes('typ host'),
-            isTetherMode: this.isTetherMode,
-          });
-        }
-      };
-
-      pc.ondatachannel = (event) => {
-        this.setupDataChannel(senderId, event.channel);
-      };
+    // If an existing PC is already open and stable with an active channel, keep it
+    if (pc && this.dataChannels.has(senderId) && this.dataChannels.get(senderId)!.readyState === 'open') {
+      return;
     }
+
+    // Cleanly close any stale/uncompleted connection so receiver ALWAYS processes incoming sender offer
+    if (pc) {
+      try { pc.close(); } catch {}
+      this.peerConnections.delete(senderId);
+      pc = undefined;
+    }
+
+    const iceServers = [
+      { urls: 'stun:stun.l.google.com:19302' },
+      { urls: 'stun:stun1.l.google.com:19302' },
+      { urls: 'stun:stun.cloudflare.com:3478' },
+      { urls: 'stun:stun.services.mozilla.com' },
+    ];
+
+    pc = new RTCPeerConnection({
+      iceServers,
+      iceCandidatePoolSize: 10,
+    });
+    this.peerConnections.set(senderId, pc);
+
+    pc.oniceconnectionstatechange = () => {
+      console.log(`[AetherDrop] Receiver ICE state with ${senderId}:`, pc!.iceConnectionState);
+      if (pc!.iceConnectionState === 'failed') {
+        try { pc!.restartIce(); } catch {}
+      }
+    };
+
+    pc.onicecandidate = (event) => {
+      if (event.candidate) {
+        this.sendSignalingMessage({ peerId: senderId }, {
+          type: 'ICE_CANDIDATE',
+          candidate: event.candidate,
+          isHost: event.candidate.candidate?.includes('typ host'),
+          isTetherMode: this.isTetherMode,
+        });
+      }
+    };
+
+    // ALWAYS hook up ondatachannel
+    pc.ondatachannel = (event) => {
+      this.setupDataChannel(senderId, event.channel);
+    };
 
     const uncappedRemoteSdp = uncapSdpBandwidth(sdp.sdp || (sdp as any));
     await pc.setRemoteDescription(new RTCSessionDescription({ type: sdp.type, sdp: uncappedRemoteSdp }));
@@ -948,7 +951,7 @@ export class WebRTCManager {
       };
 
       const acceptPromise = new Promise<boolean>((resolve) => {
-        const timer = setTimeout(() => resolve(true), 2500);
+        const timer = setTimeout(() => resolve(true), 600);
         this.fileAcceptWaiters.set(transferId, (acc) => {
           clearTimeout(timer);
           resolve(acc);
@@ -1016,7 +1019,7 @@ export class WebRTCManager {
       };
 
       const acceptPromise = new Promise<boolean>((resolve) => {
-        const timer = setTimeout(() => resolve(true), 2500);
+        const timer = setTimeout(() => resolve(true), 600);
         this.fileAcceptWaiters.set(task.id, (acc) => {
           clearTimeout(timer);
           resolve(acc);
@@ -1062,11 +1065,15 @@ export class WebRTCManager {
       let blockStart = 0;
       let blockBuffer: ArrayBuffer | null = null;
 
-      // Multi-Channel SCTP Striping: Route through all parallel active DataChannels
-      const stripes = this.peerChannelStripes.get(targetPeerId)?.filter((c) => c.readyState === 'open') || [dc];
-      task.channelCount = stripes.length;
-
       for (let chunkIdx = 0; chunkIdx < totalChunks; chunkIdx++) {
+        // Dynamically query all open parallel DataChannels
+        const openStripes = this.peerChannelStripes.get(targetPeerId)?.filter((c) => c.readyState === 'open') || [];
+        const currentStripes = openStripes.length > 0 ? openStripes : (dc.readyState === 'open' ? [dc] : []);
+        if (currentStripes.length === 0) {
+          throw new Error('All WebRTC DataChannels disconnected');
+        }
+        task.channelCount = currentStripes.length;
+
         // Dynamically query tether mode
         const activeBlockSize = this.isTetherMode ? 16 * 1024 * 1024 : BLOCK_READ_SIZE;
         const activeMaxBuffer = this.isTetherMode ? 1024 * 1024 : MAX_BUFFERED_AMOUNT;
@@ -1105,12 +1112,12 @@ export class WebRTCManager {
 
         // Least-Loaded Channel Selection:
         // Automatically route each chunk to the parallel SCTP stream with lowest buffer occupancy
-        let activeChannel = stripes[0];
+        let activeChannel = currentStripes[0];
         let minBuffered = activeChannel.bufferedAmount;
-        for (let c = 1; c < stripes.length; c++) {
-          if (stripes[c].readyState === 'open' && stripes[c].bufferedAmount < minBuffered) {
-            minBuffered = stripes[c].bufferedAmount;
-            activeChannel = stripes[c];
+        for (let c = 1; c < currentStripes.length; c++) {
+          if (currentStripes[c].bufferedAmount < minBuffered) {
+            minBuffered = currentStripes[c].bufferedAmount;
+            activeChannel = currentStripes[c];
           }
         }
 
@@ -1129,7 +1136,7 @@ export class WebRTCManager {
           }
 
           if (activeChannel.readyState !== 'open') {
-            const fallback = stripes.find((s) => s.readyState === 'open');
+            const fallback = currentStripes.find((s) => s.readyState === 'open');
             if (!fallback) throw new Error('DataChannel closed unexpectedly');
             activeChannel = fallback;
           }
@@ -1152,7 +1159,7 @@ export class WebRTCManager {
           }
 
           if (activeChannel.readyState !== 'open') {
-            const fallback = stripes.find((s) => s.readyState === 'open');
+            const fallback = currentStripes.find((s) => s.readyState === 'open');
             if (!fallback) throw new Error('DataChannel closed unexpectedly');
             activeChannel = fallback;
           }
@@ -1168,7 +1175,8 @@ export class WebRTCManager {
       }
 
       // Flush remaining data in transit across all active striped channels
-      for (const ch of stripes) {
+      const finalStripes = this.peerChannelStripes.get(targetPeerId)?.filter((c) => c.readyState === 'open') || [dc];
+      for (const ch of finalStripes) {
         if (ch.readyState === 'open' && ch.bufferedAmount > 0) {
           await this.waitForDataChannelBuffer(ch, 0);
         }
@@ -1342,7 +1350,11 @@ export class WebRTCManager {
       const chunkIdx = view.getUint32(0, false);
 
       for (const task of this.activeTransfers.values()) {
-        if (task.peerId === peerId && task.direction === 'receive' && task.status === 'transferring') {
+        const isTarget =
+          task.direction === 'receive' &&
+          task.status === 'transferring' &&
+          (task.peerId === peerId || this.activeTransfers.size === 1);
+        if (isTarget) {
           if (task.encryptionMode === 'turbo-dtls') {
             // Instant zero-copy TypedArray view - protected by native hardware WebRTC DTLS AES-256-GCM
             const rawChunk = new Uint8Array(data, 4);
