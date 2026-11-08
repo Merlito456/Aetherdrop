@@ -11,9 +11,10 @@ import { Dropzone } from './components/Dropzone';
 import { TransferList } from './components/TransferList';
 import { NearbyRadar } from './components/NearbyRadar';
 import { QRCodeModal } from './components/QRCodeModal';
+import { QRScannerModal } from './components/QRScannerModal';
 import { SecurityModal } from './components/SecurityModal';
 import { RoomModal } from './components/RoomModal';
-import { Lock, Wifi, Zap, ShieldCheck } from 'lucide-react';
+import { Lock, Wifi, Zap, ShieldCheck, Radio } from 'lucide-react';
 
 export default function App() {
   // Theme state
@@ -26,7 +27,6 @@ export default function App() {
     return false;
   });
 
-  // Sync dark class with documentElement
   useEffect(() => {
     if (darkMode) {
       document.documentElement.classList.add('dark');
@@ -56,11 +56,16 @@ export default function App() {
   });
 
   // UI Navigation & Modals
-  const [currentTab, setCurrentTab] = useState<'transfers' | 'radar' | 'security' | 'rooms'>('transfers');
+  const [currentTab, setCurrentTab] = useState<'transfers' | 'radar' | 'security' | 'rooms'>('radar');
   const [isQRModalOpen, setIsQRModalOpen] = useState(false);
+  const [isScannerModalOpen, setIsScannerModalOpen] = useState(false);
   const [isSecurityModalOpen, setIsSecurityModalOpen] = useState(false);
   const [isRoomModalOpen, setIsRoomModalOpen] = useState(false);
   const [notificationStatus, setNotificationStatus] = useState<NotificationPermission | 'unsupported'>('default');
+
+  // Signaling status
+  const [signalingStatus, setSignalingStatus] = useState<'connected' | 'connecting' | 'offline'>('connecting');
+  const [signalingMessage, setSignalingMessage] = useState<string>('Connecting to discovery network...');
 
   // Transfers & Peers
   const [peers, setPeers] = useState<Peer[]>([]);
@@ -82,7 +87,6 @@ export default function App() {
     const manager = new WebRTCManager(selfPeer, roomId, {
       onPeersUpdated: (updatedPeers) => {
         setPeers(updatedPeers);
-        // If selected peer disappeared, reset selection
         setSelectedPeerId((curr) => {
           if (curr && !updatedPeers.some((p) => p.id === curr)) {
             return updatedPeers[0]?.id || null;
@@ -101,16 +105,27 @@ export default function App() {
           return copy;
         });
       },
-      onTransferCompleted: () => {
-        // Notification & Audio are handled inside manager
-      },
-      onIncomingOffer: () => {
-        // Automatically accept or update
+      onTransferCompleted: () => {},
+      onIncomingOffer: () => {},
+      onSignalingStatus: (status, msg) => {
+        setSignalingStatus(status);
+        if (msg) setSignalingMessage(msg);
       },
     });
 
     managerRef.current = manager;
     manager.init();
+
+    // Check if URL has ?pin=... for automatic pairing
+    if (typeof window !== 'undefined') {
+      const params = new URLSearchParams(window.location.search);
+      const targetPin = params.get('pin');
+      if (targetPin && targetPin !== selfPeer.pin) {
+        setTimeout(() => {
+          manager.connectByPin(targetPin);
+        }, 1200);
+      }
+    }
 
     return () => {
       manager.destroy();
@@ -123,26 +138,23 @@ export default function App() {
     setNotificationStatus(granted ? 'granted' : 'denied');
   };
 
-  // Switch Room / PIN
+  // Switch Room
   const handleSwitchRoom = (newRoom: string) => {
     setRoomId(newRoom);
     managerRef.current?.setRoomId(newRoom);
-    // Update URL query string without reloading
     const newUrl = `${window.location.pathname}?room=${encodeURIComponent(newRoom)}`;
     window.history.replaceState(null, '', newUrl);
   };
 
-  // Send files handler
+  // Send files
   const handleSendFiles = async (files: File[], targetPeer: Peer) => {
     if (!managerRef.current || files.length === 0) return;
     for (const file of files) {
       await managerRef.current.sendFile(file, targetPeer);
     }
-    // Switch to transfers view so user immediately sees real-time progress
     setCurrentTab('transfers');
   };
 
-  // Direct send files to a specific peer
   const handleDirectSendFiles = (peer: Peer) => {
     directPeerRef.current = peer;
     directFileInputRef.current?.click();
@@ -154,6 +166,33 @@ export default function App() {
       handleSendFiles(files, directPeerRef.current);
     }
     e.target.value = '';
+  };
+
+  // Direct connect by PIN
+  const handleConnectByPin = (pin: string) => {
+    managerRef.current?.connectByPin(pin);
+  };
+
+  // Handle scanned QR code
+  const handleScanSuccess = (decodedText: string) => {
+    try {
+      if (decodedText.startsWith('http://') || decodedText.startsWith('https://')) {
+        const url = new URL(decodedText);
+        const pin = url.searchParams.get('pin');
+        const room = url.searchParams.get('room');
+        if (room && room !== roomId) {
+          handleSwitchRoom(room);
+        }
+        if (pin) {
+          setTimeout(() => handleConnectByPin(pin), 600);
+        }
+      } else {
+        // Plain PIN code scanned
+        handleConnectByPin(decodedText.trim());
+      }
+    } catch {
+      handleConnectByPin(decodedText.trim());
+    }
   };
 
   // Transfer actions
@@ -205,7 +244,7 @@ export default function App() {
         onChange={handleDirectFileInputChange}
       />
 
-      {/* Top Bar with Zone Contract */}
+      {/* Top Bar */}
       <TopBar
         currentTab={currentTab}
         setCurrentTab={(tab) => {
@@ -227,7 +266,7 @@ export default function App() {
       {/* Main Content Viewport */}
       <main className="flex-1 max-w-7xl w-full mx-auto px-4 sm:px-6 lg:px-8 py-6 sm:py-8 space-y-6">
         
-        {/* Network & Security Status Ribbon */}
+        {/* Network & Signaling Ribbon */}
         <div className="p-3.5 bg-white dark:bg-neutral-900 rounded-xl border border-neutral-200 dark:border-neutral-800 flex flex-wrap items-center justify-between gap-3 text-xs shadow-2xs">
           <div className="flex items-center gap-2 sm:gap-4 flex-wrap">
             <span className="flex items-center gap-1.5 font-medium text-neutral-800 dark:text-neutral-200">
@@ -246,9 +285,22 @@ export default function App() {
               <span>{peers.length} {peers.length === 1 ? 'device' : 'devices'} in range</span>
             </span>
             <span className="hidden sm:inline text-neutral-300 dark:text-neutral-700">|</span>
+            <span
+              className={`flex items-center gap-1 font-medium ${
+                signalingStatus === 'connected'
+                  ? 'text-emerald-600 dark:text-emerald-400'
+                  : signalingStatus === 'connecting'
+                  ? 'text-amber-600 dark:text-amber-400'
+                  : 'text-neutral-500'
+              }`}
+            >
+              <Radio className="w-3.5 h-3.5" />
+              <span>{signalingMessage}</span>
+            </span>
+            <span className="hidden sm:inline text-neutral-300 dark:text-neutral-700">|</span>
             <span className="flex items-center gap-1 text-emerald-600 dark:text-emerald-400 font-medium">
               <ShieldCheck className="w-3.5 h-3.5" />
-              <span>AES-256-GCM / WebRTC DTLS Active</span>
+              <span>AES-256-GCM Direct Channel</span>
             </span>
           </div>
 
@@ -258,12 +310,12 @@ export default function App() {
               className="hover:text-neutral-900 dark:hover:text-neutral-100 transition-colors flex items-center gap-1"
             >
               <Lock className="w-3 h-3 text-emerald-500" />
-              <span>Zero-Storage Policy Verified</span>
+              <span>Zero-Storage Memory Verified</span>
             </button>
           </div>
         </div>
 
-        {/* View Switcher: Transfers View vs Nearby Radar View */}
+        {/* View Switcher: Nearby Radar View vs Transfers View */}
         {currentTab === 'radar' ? (
           <div className="space-y-6">
             <NearbyRadar
@@ -275,10 +327,14 @@ export default function App() {
                 setCurrentTab('transfers');
               }}
               onOpenQR={() => setIsQRModalOpen(true)}
+              onOpenScanner={() => setIsScannerModalOpen(true)}
               onRefresh={() => managerRef.current?.fetchPeers()}
               simulatedPeerEnabled={simulatedPeerActive}
               onToggleSimulatedPeer={handleToggleSimulatedPeer}
               onDirectSendFiles={handleDirectSendFiles}
+              onConnectByPin={handleConnectByPin}
+              signalingStatus={signalingStatus}
+              signalingMessage={signalingMessage}
             />
 
             <Dropzone
@@ -291,7 +347,6 @@ export default function App() {
           </div>
         ) : (
           <div className="space-y-6">
-            {/* Drag & Drop Upload Zone */}
             <Dropzone
               availablePeers={peers}
               selectedPeerId={selectedPeerId}
@@ -300,7 +355,6 @@ export default function App() {
               onOpenRadar={() => setCurrentTab('radar')}
             />
 
-            {/* Real-time Transfers Management with Progress, ETA, Speed & Controls */}
             <TransferList
               transfers={transfers}
               onPause={handlePause}
@@ -321,7 +375,7 @@ export default function App() {
             <span aria-hidden="true">·</span>
             <span>Local P2P WebRTC File Transfer</span>
             <span aria-hidden="true">·</span>
-            <span>Zero-Storage Ephemeral RAM</span>
+            <span className="font-mono text-cyan-600 dark:text-cyan-400">PIN: {selfPeer.pin}</span>
           </div>
 
           <div className="flex items-center gap-4">
@@ -352,6 +406,13 @@ export default function App() {
         isOpen={isQRModalOpen}
         onClose={() => setIsQRModalOpen(false)}
         roomId={roomId}
+        peerPin={selfPeer.pin}
+      />
+
+      <QRScannerModal
+        isOpen={isScannerModalOpen}
+        onClose={() => setIsScannerModalOpen(false)}
+        onScanSuccess={handleScanSuccess}
       />
 
       <SecurityModal

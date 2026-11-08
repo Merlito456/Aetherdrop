@@ -1,23 +1,27 @@
 import React, { useEffect, useState } from 'react';
 import QRCode from 'qrcode';
-import { X, Copy, Check, Smartphone, Wifi } from 'lucide-react';
+import { X, Copy, Check, Smartphone, Wifi, KeyRound } from 'lucide-react';
 
 interface QRCodeModalProps {
   isOpen: boolean;
   onClose: () => void;
   roomId: string;
+  peerPin?: string;
 }
 
 export const QRCodeModal: React.FC<QRCodeModalProps> = ({
   isOpen,
   onClose,
   roomId,
+  peerPin,
 }) => {
   const [qrDataUrl, setQrDataUrl] = useState<string>('');
   const [copied, setCopied] = useState(false);
 
   const fullUrl = typeof window !== 'undefined'
-    ? `${window.location.origin}${window.location.pathname}?room=${encodeURIComponent(roomId)}`
+    ? `${window.location.origin}${window.location.pathname}?room=${encodeURIComponent(roomId)}${
+        peerPin ? `&pin=${encodeURIComponent(peerPin)}` : ''
+      }`
     : '';
 
   useEffect(() => {
@@ -60,14 +64,14 @@ export const QRCodeModal: React.FC<QRCodeModalProps> = ({
           </div>
 
           <h3 className="text-base font-bold text-neutral-900 dark:text-neutral-100">
-            Scan to Pair Mobile Device
+            Scan to Connect Device
           </h3>
           <p className="text-xs text-neutral-500 dark:text-neutral-400 mt-1 max-w-xs">
-            Open your phone's camera to join this local Wi-Fi transfer room instantly.
+            Open your phone camera to join this room and pair with this device instantly.
           </p>
 
           {/* QR Code Container */}
-          <div className="mt-5 p-3 bg-white rounded-xl border border-neutral-200 dark:border-neutral-700 shadow-xs">
+          <div className="mt-4 p-3 bg-white rounded-xl border border-neutral-200 dark:border-neutral-700 shadow-xs">
             {qrDataUrl ? (
               <img
                 src={qrDataUrl}
@@ -82,12 +86,23 @@ export const QRCodeModal: React.FC<QRCodeModalProps> = ({
           </div>
 
           {/* Room PIN Code info */}
-          <div className="mt-4 flex items-center gap-2 text-xs text-neutral-600 dark:text-neutral-400">
-            <Wifi className="w-3.5 h-3.5 text-cyan-500" />
-            <span>Room Code:</span>
-            <span className="font-mono font-semibold text-neutral-900 dark:text-neutral-100 bg-neutral-100 dark:bg-neutral-800 px-2 py-0.5 rounded-md">
-              {roomId}
-            </span>
+          <div className="mt-4 flex items-center justify-center gap-4 text-xs text-neutral-600 dark:text-neutral-400">
+            <div className="flex items-center gap-1.5">
+              <Wifi className="w-3.5 h-3.5 text-cyan-500" />
+              <span>Room:</span>
+              <span className="font-mono font-semibold text-neutral-900 dark:text-neutral-100 bg-neutral-100 dark:bg-neutral-800 px-2 py-0.5 rounded-md">
+                {roomId}
+              </span>
+            </div>
+            {peerPin && (
+              <div className="flex items-center gap-1.5">
+                <KeyRound className="w-3.5 h-3.5 text-emerald-500" />
+                <span>PIN:</span>
+                <span className="font-mono font-bold text-neutral-900 dark:text-neutral-100 bg-neutral-100 dark:bg-neutral-800 px-2 py-0.5 rounded-md">
+                  {peerPin}
+                </span>
+              </div>
+            )}
           </div>
 
           {/* Copy link button */}

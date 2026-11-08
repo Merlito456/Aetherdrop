@@ -23,6 +23,7 @@ const AVATAR_COLORS = [
 
 export function getOrCreatePeerIdentity(): {
   id: string;
+  pin: string;
   name: string;
   deviceType: DeviceType;
   browser: string;
@@ -34,6 +35,12 @@ export function getOrCreatePeerIdentity(): {
   if (!id) {
     id = 'peer_' + Math.random().toString(36).substring(2, 10);
     sessionStorage.setItem(key, id);
+  }
+
+  let pin = sessionStorage.getItem('aetherdrop_peer_pin');
+  if (!pin) {
+    pin = Math.floor(1000 + Math.random() * 9000).toString();
+    sessionStorage.setItem('aetherdrop_peer_pin', pin);
   }
 
   let name = sessionStorage.getItem('aetherdrop_peer_name');
@@ -48,7 +55,7 @@ export function getOrCreatePeerIdentity(): {
   const deviceType = detectDeviceType();
   const browser = detectBrowser();
 
-  return { id, name, deviceType, browser, avatarColor: color };
+  return { id, pin, name, deviceType, browser, avatarColor: color };
 }
 
 export function detectDeviceType(): DeviceType {

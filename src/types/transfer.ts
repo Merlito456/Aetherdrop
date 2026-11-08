@@ -2,6 +2,7 @@ export type DeviceType = 'desktop' | 'mobile' | 'tablet';
 
 export interface Peer {
   id: string;
+  pin: string;
   name: string;
   deviceType: DeviceType;
   browser: string;
