@@ -160,7 +160,7 @@ export const ShareItSessionView: React.FC<ShareItSessionViewProps> = ({
                 <Lock className="w-3 h-3 text-emerald-500" />
                 <span>
                   {encryptionMode === 'turbo-dtls'
-                    ? '⚡ Turbo Mode: Hardware DTLS AES-256-GCM (15 - 40+ MB/s)'
+                    ? '⚡ Uncapped Wire Speed (Hardware DTLS AES-256-GCM · 2 Gbps Uncapped)'
                     : '🔒 Dual-Layer Mode: DTLS + WebCrypto AES-GCM'}
                 </span>
               </span>

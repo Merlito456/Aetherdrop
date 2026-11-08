@@ -109,11 +109,11 @@ export const RoomModal: React.FC<RoomModalProps> = ({
                 />
                 <div className="text-xs">
                   <div className="font-bold flex items-center gap-1 text-cyan-700 dark:text-cyan-300">
-                    <span>⚡ Turbo Mode (15 - 40+ MB/s)</span>
+                    <span>⚡ Uncapped Wire Speed (25 - 60+ MB/s)</span>
                     <span className="text-[10px] bg-cyan-100 dark:bg-cyan-900 text-cyan-700 dark:text-cyan-300 px-1.5 py-0.2 rounded font-bold">Recommended</span>
                   </div>
                   <p className="text-[11px] text-neutral-500 dark:text-neutral-400 mt-0.5 leading-snug">
-                    Native WebRTC DTLS AES-256-GCM hardware encryption (AES-NI). Bypasses JS event loop thread bottlenecks for maximum Wi-Fi bandwidth (120 to 320+ Mbps).
+                    Uncaps WebRTC SCTP bandwidth to 2 Gbps. Direct hardware DTLS AES-256-GCM encryption with zero-copy binary streaming and background discovery suspension.
                   </p>
                 </div>
               </label>

@@ -48,7 +48,7 @@ export interface TransferTask {
   // File object reference when sending
   rawFile?: File;
   // Chunks storage when receiving
-  receivedChunks?: ArrayBuffer[];
+  receivedChunks?: (ArrayBuffer | Uint8Array)[];
   totalChunks?: number;
   chunkKey?: CryptoKey;
 }
