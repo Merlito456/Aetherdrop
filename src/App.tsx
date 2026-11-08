@@ -398,6 +398,7 @@ export default function App() {
         onOpenSecurity={() => setIsSecurityModalOpen(true)}
         onOpenSpeedOptimizer={() => setIsSpeedModalOpen(true)}
         onOpenPinModal={() => setIsPinModalOpen(true)}
+        onStartSend={handleStartSend}
         speedProfile={speedProfile}
         notificationStatus={notificationStatus}
         onRequestNotification={handleRequestNotification}
@@ -491,6 +492,11 @@ export default function App() {
             speedProfile={speedProfile}
             onOpenSpeedOptimizer={() => setIsSpeedModalOpen(true)}
             onOpenPinModal={() => setIsPinModalOpen(true)}
+            onPasteFiles={(files) => {
+              setStagedFilesToSend(files);
+              setCurrentView('send-select');
+            }}
+            onConnectRecentPeer={(recent) => handleConnectByPin(recent.pin)}
           />
         )}
 
@@ -499,6 +505,12 @@ export default function App() {
           <ShareItFileSelector
             onBack={() => setCurrentView('home')}
             onProceedToRadar={handleProceedToRadar}
+            connectedPeers={peers}
+            initialFiles={stagedFilesToSend}
+            onDirectSend={(files, peer) => {
+              setStagedFilesToSend(files);
+              handleSelectReceiverAndSend(peer);
+            }}
           />
         )}
 
@@ -671,6 +683,7 @@ export default function App() {
         isOpen={isScannerModalOpen}
         onClose={() => setIsScannerModalOpen(false)}
         onScanSuccess={handleScanSuccess}
+        onSwitchToPin={() => setIsPinModalOpen(true)}
       />
 
       <SecurityModal

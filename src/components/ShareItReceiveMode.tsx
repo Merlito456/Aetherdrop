@@ -12,8 +12,20 @@ import {
   Laptop,
   Tablet,
   Radio,
+  HardDrive,
+  Sun,
+  Eye,
+  CheckCircle2,
 } from 'lucide-react';
 import { Peer } from '../types/transfer';
+import {
+  requestWakeLock,
+  releaseWakeLock,
+  isWakeLockSupported,
+  getStorageEstimate,
+  StorageEstimateResult,
+  triggerHaptic,
+} from '../utils/systemWorkflows';
 
 interface ShareItReceiveModeProps {
   selfPeer: Peer;
@@ -35,10 +47,22 @@ export const ShareItReceiveMode: React.FC<ShareItReceiveModeProps> = ({
   const [qrDataUrl, setQrDataUrl] = useState<string>('');
   const [copiedLink, setCopiedLink] = useState(false);
   const [copiedPin, setCopiedPin] = useState(false);
+  const [wakeLockActive, setWakeLockActive] = useState(false);
+  const [storageInfo, setStorageInfo] = useState<StorageEstimateResult | null>(null);
 
   const fullUrl = typeof window !== 'undefined'
     ? `${window.location.origin}${window.location.pathname}?room=${encodeURIComponent(roomId)}&pin=${encodeURIComponent(selfPeer.pin)}`
     : '';
+
+  // Request screen wake lock so receiver device stays awake
+  useEffect(() => {
+    requestWakeLock().then((active) => setWakeLockActive(active));
+    getStorageEstimate().then((info) => setStorageInfo(info));
+
+    return () => {
+      releaseWakeLock();
+    };
+  }, []);
 
   useEffect(() => {
     if (fullUrl) {
@@ -58,12 +82,14 @@ export const ShareItReceiveMode: React.FC<ShareItReceiveModeProps> = ({
   const handleCopyLink = () => {
     navigator.clipboard.writeText(fullUrl);
     setCopiedLink(true);
+    triggerHaptic('tap');
     setTimeout(() => setCopiedLink(false), 2000);
   };
 
   const handleCopyPin = () => {
     navigator.clipboard.writeText(selfPeer.pin);
     setCopiedPin(true);
+    triggerHaptic('tap');
     setTimeout(() => setCopiedPin(false), 2000);
   };
 
@@ -92,9 +118,18 @@ export const ShareItReceiveMode: React.FC<ShareItReceiveModeProps> = ({
           <span>Exit Receive Mode</span>
         </button>
 
-        <div className="flex items-center gap-1.5 text-xs font-bold text-emerald-600 dark:text-emerald-400">
-          <Radio className="w-4 h-4 animate-pulse" />
-          <span>Ready to Receive</span>
+        <div className="flex items-center gap-2">
+          {wakeLockActive && (
+            <span className="text-[11px] font-semibold text-amber-600 dark:text-amber-400 bg-amber-50 dark:bg-amber-950/60 px-2 py-0.5 rounded-md border border-amber-200 dark:border-amber-800 flex items-center gap-1">
+              <Sun className="w-3 h-3" />
+              <span>Screen Awake</span>
+            </span>
+          )}
+
+          <div className="flex items-center gap-1.5 text-xs font-bold text-emerald-600 dark:text-emerald-400">
+            <Radio className="w-4 h-4 animate-pulse" />
+            <span>Ready to Receive</span>
+          </div>
         </div>
       </div>
 
@@ -106,9 +141,16 @@ export const ShareItReceiveMode: React.FC<ShareItReceiveModeProps> = ({
               ✓
             </div>
             <div>
-              <p className="text-xs font-bold text-emerald-900 dark:text-emerald-100">
-                Connected to {connectedPeers[0].name} ({connectedPeers[0].deviceType})!
-              </p>
+              <div className="flex items-center gap-2">
+                <p className="text-xs font-bold text-emerald-900 dark:text-emerald-100">
+                  Connected to {connectedPeers[0].name}!
+                </p>
+                {connectedPeers[0].latency && (
+                  <span className="text-[10px] font-mono px-1.5 py-0.2 rounded bg-emerald-200 dark:bg-emerald-900 text-emerald-800 dark:text-emerald-200 font-bold">
+                    {connectedPeers[0].latency}ms
+                  </span>
+                )}
+              </div>
               <p className="text-[11px] text-emerald-700 dark:text-emerald-300">
                 Paired via PIN {connectedPeers[0].pin} · Ready for file transfer
               </p>
@@ -196,8 +238,18 @@ export const ShareItReceiveMode: React.FC<ShareItReceiveModeProps> = ({
           </p>
         </div>
 
+        {/* Storage Quota Estimate */}
+        {storageInfo && (
+          <div className="relative z-10 mt-4 px-3.5 py-1.5 rounded-xl bg-neutral-50 dark:bg-neutral-800/60 border border-neutral-200 dark:border-neutral-700 flex items-center gap-2 text-xs text-neutral-600 dark:text-neutral-400 font-mono">
+            <HardDrive className="w-3.5 h-3.5 text-cyan-500 shrink-0" />
+            <span>Available Storage: <strong className="text-neutral-900 dark:text-neutral-100">{storageInfo.formattedAvailable}</strong></span>
+            <span aria-hidden="true">·</span>
+            <span>{storageInfo.percentUsed}% used</span>
+          </div>
+        )}
+
         {/* Network & Security specs */}
-        <div className="mt-5 flex flex-wrap items-center justify-center gap-4 text-xs text-neutral-500 dark:text-neutral-400">
+        <div className="mt-4 flex flex-wrap items-center justify-center gap-4 text-xs text-neutral-500 dark:text-neutral-400">
           <span className="flex items-center gap-1.5">
             <Wifi className="w-3.5 h-3.5 text-cyan-500" />
             <span>Room: <strong className="font-mono text-neutral-800 dark:text-neutral-200">{roomId}</strong></span>

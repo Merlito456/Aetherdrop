@@ -1,6 +1,4 @@
-/**
- * Synthesizes sound effects via Web Audio API without requiring any external assets.
- */
+// Synthesizes sound effects via Web Audio API without requiring any external assets.
 
 let audioCtx: AudioContext | null = null;
 
@@ -21,69 +19,108 @@ function getAudioContext(): AudioContext | null {
   }
 }
 
-// Gentle pleasant ascending chime when file transfer finishes successfully
+// Gentle pleasant ascending chime when file transfer finishes successfully (C5 -> E5 -> G5)
 export function playSuccessChime() {
   const ctx = getAudioContext();
   if (!ctx) return;
 
   const now = ctx.currentTime;
-  
-  // Note 1 (E5: ~659.25Hz)
-  const osc1 = ctx.createOscillator();
-  const gain1 = ctx.createGain();
-  osc1.type = 'sine';
-  osc1.frequency.setValueAtTime(659.25, now);
-  gain1.gain.setValueAtTime(0.08, now);
-  gain1.gain.exponentialRampToValueAtTime(0.001, now + 0.35);
-  osc1.connect(gain1);
-  gain1.connect(ctx.destination);
-  osc1.start(now);
-  osc1.stop(now + 0.35);
+  const notes = [
+    { freq: 523.25, time: 0.00, dur: 0.28 }, // C5
+    { freq: 659.25, time: 0.10, dur: 0.28 }, // E5
+    { freq: 783.99, time: 0.20, dur: 0.45 }, // G5
+  ];
 
-  // Note 2 (B5: ~987.77Hz)
-  const osc2 = ctx.createOscillator();
-  const gain2 = ctx.createGain();
-  osc2.type = 'sine';
-  osc2.frequency.setValueAtTime(987.77, now + 0.12);
-  gain2.gain.setValueAtTime(0.09, now + 0.12);
-  gain2.gain.exponentialRampToValueAtTime(0.001, now + 0.6);
-  osc2.connect(gain2);
-  gain2.connect(ctx.destination);
-  osc2.start(now + 0.12);
-  osc2.stop(now + 0.6);
+  notes.forEach(({ freq, time, dur }) => {
+    const osc = ctx.createOscillator();
+    const gain = ctx.createGain();
+    osc.type = 'sine';
+    osc.frequency.setValueAtTime(freq, now + time);
+
+    gain.gain.setValueAtTime(0.0001, now + time);
+    gain.gain.exponentialRampToValueAtTime(0.08, now + time + 0.03);
+    gain.gain.exponentialRampToValueAtTime(0.0001, now + time + dur);
+
+    osc.connect(gain);
+    gain.connect(ctx.destination);
+
+    osc.start(now + time);
+    osc.stop(now + time + dur);
+  });
 }
 
-// Subtle click / start tone
+// Chime when a peer device is discovered or paired via PIN (F#5 -> C#6)
+export function playPeerConnectedChime() {
+  const ctx = getAudioContext();
+  if (!ctx) return;
+
+  const now = ctx.currentTime;
+  const notes = [
+    { freq: 739.99, time: 0.00, dur: 0.22 }, // F#5
+    { freq: 1108.73, time: 0.11, dur: 0.38 }, // C#6
+  ];
+
+  notes.forEach(({ freq, time, dur }) => {
+    const osc = ctx.createOscillator();
+    const gain = ctx.createGain();
+    osc.type = 'sine';
+    osc.frequency.setValueAtTime(freq, now + time);
+
+    gain.gain.setValueAtTime(0.0001, now + time);
+    gain.gain.exponentialRampToValueAtTime(0.07, now + time + 0.02);
+    gain.gain.exponentialRampToValueAtTime(0.0001, now + time + dur);
+
+    osc.connect(gain);
+    gain.connect(ctx.destination);
+
+    osc.start(now + time);
+    osc.stop(now + time + dur);
+  });
+}
+
+// Subtle high-tech chirp for transfer start
 export function playStartTone() {
   const ctx = getAudioContext();
   if (!ctx) return;
   const now = ctx.currentTime;
   const osc = ctx.createOscillator();
   const gain = ctx.createGain();
-  osc.type = 'triangle';
-  osc.frequency.setValueAtTime(523.25, now); // C5
-  gain.gain.setValueAtTime(0.05, now);
-  gain.gain.exponentialRampToValueAtTime(0.001, now + 0.15);
+
+  osc.type = 'sine';
+  osc.frequency.setValueAtTime(440, now);
+  osc.frequency.exponentialRampToValueAtTime(880, now + 0.12);
+
+  gain.gain.setValueAtTime(0.0001, now);
+  gain.gain.exponentialRampToValueAtTime(0.05, now + 0.02);
+  gain.gain.exponentialRampToValueAtTime(0.0001, now + 0.14);
+
   osc.connect(gain);
   gain.connect(ctx.destination);
+
   osc.start(now);
-  osc.stop(now + 0.15);
+  osc.stop(now + 0.14);
 }
 
-// Soft tone for error/cancellation
+// Soft discrete tone for error/cancellation
 export function playErrorTone() {
   const ctx = getAudioContext();
   if (!ctx) return;
   const now = ctx.currentTime;
   const osc = ctx.createOscillator();
   const gain = ctx.createGain();
-  osc.type = 'sawtooth';
-  osc.frequency.setValueAtTime(260, now);
-  osc.frequency.linearRampToValueAtTime(200, now + 0.25);
-  gain.gain.setValueAtTime(0.06, now);
-  gain.gain.exponentialRampToValueAtTime(0.001, now + 0.25);
+
+  osc.type = 'triangle';
+  osc.frequency.setValueAtTime(320, now);
+  osc.frequency.linearRampToValueAtTime(220, now + 0.22);
+
+  gain.gain.setValueAtTime(0.0001, now);
+  gain.gain.exponentialRampToValueAtTime(0.05, now + 0.03);
+  gain.gain.exponentialRampToValueAtTime(0.0001, now + 0.22);
+
   osc.connect(gain);
   gain.connect(ctx.destination);
+
   osc.start(now);
-  osc.stop(now + 0.25);
+  osc.stop(now + 0.22);
 }
+

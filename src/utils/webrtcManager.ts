@@ -7,9 +7,10 @@ import {
   decryptChunk,
   generateFingerprint,
 } from './crypto';
-import { playSuccessChime, playStartTone, playErrorTone } from './audio';
+import { playSuccessChime, playStartTone, playErrorTone, playPeerConnectedChime } from './audio';
 import { sendTransferNotification } from './notifications';
 import { formatBytes } from './formatters';
+import { saveRecentPeer, triggerHaptic } from './systemWorkflows';
 import mqtt, { MqttClient } from 'mqtt';
 
 // Safely raises WebRTC SCTP DataChannel bitrate limits for ultra high-speed local Wi-Fi / hotspot throughput
@@ -78,6 +79,7 @@ export class WebRTCManager {
   private httpRelayPollInterval: any = null;
   private wsHeartbeatInterval: any = null;
   private seenPacketIds = new Set<string>();
+  private pingIntervals = new Map<string, any>();
 
   // WebRTC PeerConnections & Multi-Channel Striped DataChannels
   private peerConnections = new Map<string, RTCPeerConnection>();
@@ -206,6 +208,11 @@ export class WebRTCManager {
       }
     }
     this.peerChannelStripes.clear();
+
+    for (const timer of this.pingIntervals.values()) {
+      try { clearInterval(timer); } catch {}
+    }
+    this.pingIntervals.clear();
 
     for (const dc of this.dataChannels.values()) {
       try { dc.close(); } catch {}
@@ -753,6 +760,9 @@ export class WebRTCManager {
       this.peerHeartbeats.set(sender.id, Date.now());
       this.broadcastPeersList();
       this.callbacks.onPeerConnectedByPin?.(incomingPeer);
+      playPeerConnectedChime();
+      saveRecentPeer(incomingPeer);
+      triggerHaptic('connect');
 
       // Immediately acknowledge PIN pairing so sender gets receiver's full profile
       this.sendSignalingMessage({ peerId: sender.id, pin: sender.pin }, {
@@ -773,6 +783,9 @@ export class WebRTCManager {
       this.peers.set(remotePeer.id, remotePeer);
       this.peerHeartbeats.set(remotePeer.id, Date.now());
       this.broadcastPeersList();
+      playPeerConnectedChime();
+      saveRecentPeer(remotePeer);
+      triggerHaptic('connect');
 
       const waiters = this.pinWaiters.get(remotePeer.pin) || [];
       for (const w of waiters) {
@@ -897,6 +910,8 @@ export class WebRTCManager {
       this.peers.set(target.id, target);
       this.peerHeartbeats.set(target.id, Date.now());
       this.broadcastPeersList();
+      saveRecentPeer(target);
+      triggerHaptic('connect');
       this.callbacks.onPeerConnectedByPin?.(target);
 
       // Proactively establish WebRTC DataChannel connection
@@ -1241,6 +1256,20 @@ export class WebRTCManager {
         }
         this.dataChannelWaiters.delete(peerId);
       }
+
+      // Start lightweight periodic RTT latency ping (every 3s)
+      if (!this.pingIntervals.has(peerId) && (dc.label === 'aetherdrop_control' || !dc.label.startsWith('aetherdrop_ch_'))) {
+        const pingTimer = setInterval(() => {
+          if (dc.readyState === 'open') {
+            try {
+              dc.send(JSON.stringify({ type: 'PING', ts: Date.now() }));
+            } catch {}
+          }
+        }, 3000);
+        this.pingIntervals.set(peerId, pingTimer);
+        // Immediate initial ping
+        try { dc.send(JSON.stringify({ type: 'PING', ts: Date.now() })); } catch {}
+      }
     };
 
     dc.onclose = () => {
@@ -1249,6 +1278,10 @@ export class WebRTCManager {
       this.peerChannelStripes.set(peerId, filtered);
 
       if (filtered.length === 0) {
+        if (this.pingIntervals.has(peerId)) {
+          clearInterval(this.pingIntervals.get(peerId));
+          this.pingIntervals.delete(peerId);
+        }
         this.dataChannels.delete(peerId);
         const peer = this.peers.get(peerId);
         if (peer) {
@@ -1691,6 +1724,7 @@ export class WebRTCManager {
     this.notifyTransferProgress(task, true);
     this.callbacks.onTransferCompleted(task);
     playSuccessChime();
+    triggerHaptic('success');
     sendTransferNotification('File Sent Successfully', {
       body: `${task.fileName} (${formatBytes(task.fileSize)}) delivered to ${task.peerName}`,
     });
@@ -1858,6 +1892,7 @@ export class WebRTCManager {
       this.notifyTransferProgress(task, true);
       this.callbacks.onTransferCompleted(task);
       playSuccessChime();
+      triggerHaptic('success');
       sendTransferNotification('File Sent Successfully', {
         body: `${task.fileName} (${formatBytes(task.fileSize)}) delivered to ${task.peerName}`,
       });
@@ -2188,6 +2223,18 @@ export class WebRTCManager {
               this.finalizeReceivedFile(task);
             }
           }
+        } else if (msg.type === 'PING') {
+          const dc = this.dataChannels.get(peerId);
+          if (dc && dc.readyState === 'open') {
+            try { dc.send(JSON.stringify({ type: 'PONG', ts: msg.ts })); } catch {}
+          }
+        } else if (msg.type === 'PONG' && msg.ts) {
+          const rtt = Math.max(1, Math.round((Date.now() - msg.ts) / 2));
+          const p = this.peers.get(peerId);
+          if (p) {
+            p.latency = rtt;
+            this.broadcastPeersList();
+          }
         }
       } catch (e) {
         console.warn('DataChannel message parse error:', e);
@@ -2241,6 +2288,7 @@ export class WebRTCManager {
     this.notifyTransferProgress(task, true);
     this.callbacks.onTransferCompleted(task);
     playSuccessChime();
+    triggerHaptic('success');
     sendTransferNotification('File Received', {
       body: `${task.fileName} (${formatBytes(task.fileSize)}) received and saved.`,
     });

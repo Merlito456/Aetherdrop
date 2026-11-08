@@ -287,6 +287,10 @@ export const NearbyRadar: React.FC<NearbyRadarProps> = ({
                           <span className="text-[10px] px-1.5 py-0.2 rounded-md bg-emerald-100 dark:bg-emerald-950/70 text-emerald-700 dark:text-emerald-300 font-mono">
                             TEST
                           </span>
+                        ) : peer.latency ? (
+                          <span className="text-[10px] font-mono px-1.5 py-0.2 rounded bg-emerald-100 dark:bg-emerald-950 text-emerald-600 dark:text-emerald-400 font-bold">
+                            {peer.latency}ms
+                          </span>
                         ) : (
                           <span className="w-2 h-2 rounded-full bg-emerald-500" />
                         )}

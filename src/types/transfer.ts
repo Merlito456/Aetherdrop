@@ -10,6 +10,17 @@ export interface Peer {
   isSelf?: boolean;
   status: 'available' | 'connecting' | 'connected' | 'busy';
   connectionType?: 'webrtc-direct' | 'webrtc-lan' | 'simulated';
+  latency?: number; // RTT in milliseconds
+}
+
+export interface RecentPeer {
+  id: string;
+  pin: string;
+  name: string;
+  deviceType: DeviceType;
+  browser?: string;
+  avatarColor: string;
+  lastSeen: number;
 }
 
 export type TransferStatus =

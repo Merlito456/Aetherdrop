@@ -1,3 +1,4 @@
+import React, { useEffect, useState, useCallback } from 'react';
 import {
   Send,
   Download,
@@ -13,8 +14,11 @@ import {
   Zap,
   Gauge,
   KeyRound,
+  HardDrive,
+  Clipboard,
 } from 'lucide-react';
-import { Peer, SpeedProfile } from '../types/transfer';
+import { Peer, RecentPeer, SpeedProfile } from '../types/transfer';
+import { getRecentPeers, getStorageEstimate, StorageEstimateResult, extractFilesFromClipboard, triggerHaptic } from '../utils/systemWorkflows';
 
 interface ShareItHomeProps {
   selfPeer: Peer;
@@ -35,6 +39,8 @@ interface ShareItHomeProps {
   speedProfile?: SpeedProfile;
   onOpenSpeedOptimizer?: () => void;
   onOpenPinModal?: () => void;
+  onPasteFiles?: (files: File[]) => void;
+  onConnectRecentPeer?: (recent: RecentPeer) => void;
 }
 
 export const ShareItHome: React.FC<ShareItHomeProps> = ({
@@ -55,7 +61,35 @@ export const ShareItHome: React.FC<ShareItHomeProps> = ({
   speedProfile = 'turbo-8x',
   onOpenSpeedOptimizer,
   onOpenPinModal,
+  onPasteFiles,
+  onConnectRecentPeer,
 }) => {
+  const [recentPeers, setRecentPeers] = useState<RecentPeer[]>([]);
+  const [storageInfo, setStorageInfo] = useState<StorageEstimateResult | null>(null);
+
+  useEffect(() => {
+    const list = getRecentPeers().filter((p) => p.pin !== selfPeer.pin);
+    setRecentPeers(list);
+    getStorageEstimate().then((info) => setStorageInfo(info));
+  }, [selfPeer.pin]);
+
+  // Global paste handler on Home screen
+  const handlePaste = useCallback((e: ClipboardEvent) => {
+    const files = extractFilesFromClipboard(e);
+    if (files.length > 0) {
+      e.preventDefault();
+      triggerHaptic('tap');
+      if (onPasteFiles) {
+        onPasteFiles(files);
+      }
+    }
+  }, [onPasteFiles]);
+
+  useEffect(() => {
+    window.addEventListener('paste', handlePaste);
+    return () => window.removeEventListener('paste', handlePaste);
+  }, [handlePaste]);
+
   const getDeviceIcon = () => {
     switch (selfPeer.deviceType) {
       case 'mobile':
@@ -87,19 +121,27 @@ export const ShareItHome: React.FC<ShareItHomeProps> = ({
                 PIN: {selfPeer.pin}
               </span>
             </div>
-            <div className="flex items-center gap-2 text-xs text-neutral-500 dark:text-neutral-400 mt-1">
+            <div className="flex items-center gap-2 text-xs text-neutral-500 dark:text-neutral-400 mt-1 flex-wrap">
               <span className="flex items-center gap-1">
                 <Wifi className="w-3.5 h-3.5 text-cyan-500" />
                 <span>Room:</span>
                 <button
                   onClick={onOpenRooms}
-                  className="font-mono text-cyan-600 dark:text-cyan-400 hover:underline font-medium"
+                  className="font-mono text-cyan-600 dark:text-cyan-400 hover:underline font-medium cursor-pointer"
                 >
                   {roomId}
                 </button>
               </span>
               <span aria-hidden="true">·</span>
               <span>{peersCount} {peersCount === 1 ? 'device nearby' : 'devices nearby'}</span>
+              {storageInfo && (
+                <>
+                  <span aria-hidden="true">·</span>
+                  <span className="font-mono text-[11px] text-neutral-400">
+                    {storageInfo.formattedAvailable} free
+                  </span>
+                </>
+              )}
             </div>
           </div>
         </div>
@@ -140,6 +182,41 @@ export const ShareItHome: React.FC<ShareItHomeProps> = ({
           </button>
         </div>
       </div>
+
+      {/* Recent Devices Strip on Home */}
+      {recentPeers.length > 0 && (
+        <div className="p-3.5 bg-white dark:bg-neutral-900 border border-neutral-200 dark:border-neutral-800 rounded-2xl flex flex-wrap items-center justify-between gap-3 text-xs shadow-2xs">
+          <div className="flex items-center gap-2">
+            <div className="w-7 h-7 rounded-lg bg-cyan-50 dark:bg-cyan-950/60 flex items-center justify-center text-cyan-600 dark:text-cyan-400">
+              <History className="w-4 h-4" />
+            </div>
+            <div>
+              <span className="font-bold text-neutral-900 dark:text-neutral-100">
+                Recent Paired Devices
+              </span>
+              <p className="text-[11px] text-neutral-400">
+                Tap any device to reconnect immediately
+              </p>
+            </div>
+          </div>
+
+          <div className="flex items-center gap-2 overflow-x-auto">
+            {recentPeers.map((r) => (
+              <button
+                key={r.pin}
+                onClick={() => onConnectRecentPeer?.(r)}
+                className="px-3 py-1.5 rounded-xl border border-neutral-200 dark:border-neutral-700 hover:border-cyan-400 dark:hover:border-cyan-600 bg-neutral-50 dark:bg-neutral-800 text-xs font-semibold text-neutral-800 dark:text-neutral-200 flex items-center gap-1.5 transition-colors cursor-pointer shrink-0"
+              >
+                <span className="w-2 h-2 rounded-full" style={{ backgroundColor: r.avatarColor }} />
+                <span>{r.name}</span>
+                <span className="font-mono text-[10px] text-cyan-600 dark:text-cyan-400 font-bold">
+                  ({r.pin})
+                </span>
+              </button>
+            ))}
+          </div>
+        </div>
+      )}
 
       {/* Wi-Fi Tethering / Mobile Hotspot Quick-Enable Banner */}
       <div className={`p-4 rounded-2xl border transition-all ${
@@ -221,42 +298,6 @@ export const ShareItHome: React.FC<ShareItHomeProps> = ({
           </div>
         )}
       </div>
-
-      {/* Quick Connect with 4-Digit PIN Card */}
-      {onOpenPinModal && (
-        <div className="bg-white dark:bg-neutral-900 rounded-3xl border border-neutral-200 dark:border-neutral-800 p-5 shadow-xs flex flex-col sm:flex-row sm:items-center justify-between gap-4">
-          <div className="flex items-center gap-3.5">
-            <div className="w-12 h-12 rounded-2xl bg-cyan-50 dark:bg-cyan-950/60 border border-cyan-200 dark:border-cyan-800 flex items-center justify-center text-cyan-600 dark:text-cyan-400 shrink-0 shadow-xs">
-              <KeyRound className="w-6 h-6 stroke-[2.2]" />
-            </div>
-            <div>
-              <div className="flex items-center gap-2 flex-wrap">
-                <h4 className="text-sm font-bold text-neutral-900 dark:text-neutral-100">
-                  Connect via 4-Digit PIN
-                </h4>
-                <span className="text-[10px] font-mono font-bold px-2 py-0.5 rounded-full bg-cyan-100 dark:bg-cyan-950 text-cyan-700 dark:text-cyan-300">
-                  Instant Pairing
-                </span>
-              </div>
-              <p className="text-xs text-neutral-500 dark:text-neutral-400 mt-0.5">
-                Type the 4-digit code shown on the receiver screen to connect directly
-              </p>
-            </div>
-          </div>
-
-          <div className="flex items-center gap-3 shrink-0">
-            <button
-              type="button"
-              onClick={onOpenPinModal}
-              className="w-full sm:w-auto px-4 py-2.5 rounded-xl bg-gradient-to-r from-cyan-600 to-blue-600 hover:from-cyan-500 hover:to-blue-500 text-white font-bold text-xs flex items-center justify-center gap-2 shadow-sm shadow-cyan-600/20 transition-all cursor-pointer active:scale-98"
-            >
-              <KeyRound className="w-3.5 h-3.5" />
-              <span>Enter 4-Digit PIN</span>
-              <ArrowRight className="w-3.5 h-3.5" />
-            </button>
-          </div>
-        </div>
-      )}
 
       {/* SHAREit Two Big Action Buttons */}
       <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 sm:gap-6">
@@ -342,7 +383,7 @@ export const ShareItHome: React.FC<ShareItHomeProps> = ({
           </div>
           <button
             onClick={onViewTransfers}
-            className="text-cyan-600 dark:text-cyan-400 font-semibold hover:underline"
+            className="text-cyan-600 dark:text-cyan-400 font-semibold hover:underline cursor-pointer"
           >
             View History →
           </button>

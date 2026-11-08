@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useState, useMemo } from 'react';
 import {
   ArrowUpRight,
   ArrowDownLeft,
@@ -18,9 +18,19 @@ import {
   Code,
   Clock,
   Zap,
+  Search,
+  Trash2,
+  HardDrive,
+  Eye,
+  Info,
+  FileDown,
+  RotateCcw,
 } from 'lucide-react';
 import { TransferTask } from '../types/transfer';
 import { formatBytes, formatSpeed, formatETA, getFileCategory } from '../utils/formatters';
+import { FilePreviewModal, PreviewableFile } from './FilePreviewModal';
+import { TransferInspectorModal } from './TransferInspectorModal';
+import { triggerHaptic } from '../utils/systemWorkflows';
 
 interface TransferListProps {
   transfers: TransferTask[];
@@ -37,20 +47,125 @@ export const TransferList: React.FC<TransferListProps> = ({
   onCancel,
   onClearCompleted,
 }) => {
-  const [filter, setFilter] = useState<'all' | 'active' | 'completed' | 'paused'>('all');
+  const [statusFilter, setStatusFilter] = useState<'all' | 'active' | 'completed' | 'paused' | 'sent' | 'received'>('all');
+  const [categoryFilter, setCategoryFilter] = useState<string>('all');
+  const [searchQuery, setSearchQuery] = useState('');
 
-  const filteredTransfers = transfers.filter((t) => {
-    if (filter === 'active') return t.status === 'transferring' || t.status === 'encrypting' || t.status === 'connecting';
-    if (filter === 'completed') return t.status === 'completed';
-    if (filter === 'paused') return t.status === 'paused' || t.status === 'cancelled';
-    return true;
-  });
+  // Modals state
+  const [previewItem, setPreviewItem] = useState<PreviewableFile | null>(null);
+  const [isPreviewOpen, setIsPreviewOpen] = useState(false);
+  const [inspectTask, setInspectTask] = useState<TransferTask | null>(null);
+  const [isInspectOpen, setIsInspectOpen] = useState(false);
 
-  const activeCount = transfers.filter(
-    (t) => t.status === 'transferring' || t.status === 'encrypting' || t.status === 'connecting'
-  ).length;
+  const activeCount = useMemo(
+    () =>
+      transfers.filter(
+        (t) => t.status === 'transferring' || t.status === 'encrypting' || t.status === 'connecting'
+      ).length,
+    [transfers]
+  );
 
-  const completedCount = transfers.filter((t) => t.status === 'completed').length;
+  const completedCount = useMemo(
+    () => transfers.filter((t) => t.status === 'completed').length,
+    [transfers]
+  );
+
+  const sentCount = useMemo(() => transfers.filter((t) => t.direction === 'send').length, [transfers]);
+  const receivedCount = useMemo(() => transfers.filter((t) => t.direction === 'receive').length, [transfers]);
+
+  const totalTransferredBytes = useMemo(
+    () => transfers.reduce((sum, t) => sum + t.bytesTransferred, 0),
+    [transfers]
+  );
+
+  const filteredTransfers = useMemo(() => {
+    return transfers.filter((t) => {
+      // Status & Direction filters
+      if (statusFilter === 'active' && !(t.status === 'transferring' || t.status === 'encrypting' || t.status === 'connecting')) return false;
+      if (statusFilter === 'completed' && t.status !== 'completed') return false;
+      if (statusFilter === 'paused' && !(t.status === 'paused' || t.status === 'cancelled' || t.status === 'error')) return false;
+      if (statusFilter === 'sent' && t.direction !== 'send') return false;
+      if (statusFilter === 'received' && t.direction !== 'receive') return false;
+
+      // Category filter
+      if (categoryFilter !== 'all') {
+        const cat = getFileCategory(t.mimeType, t.fileName);
+        if (cat !== categoryFilter) return false;
+      }
+
+      // Search query
+      if (searchQuery.trim()) {
+        const q = searchQuery.toLowerCase().trim();
+        if (!t.fileName.toLowerCase().includes(q) && !t.peerName.toLowerCase().includes(q)) {
+          return false;
+        }
+      }
+
+      return true;
+    });
+  }, [transfers, statusFilter, categoryFilter, searchQuery]);
+
+  const handleDownloadAllCompleted = () => {
+    triggerHaptic('tap');
+    const downloadable = transfers.filter((t) => t.status === 'completed' && t.downloadUrl && t.direction === 'receive');
+    downloadable.forEach((task, idx) => {
+      setTimeout(() => {
+        const a = document.createElement('a');
+        a.href = task.downloadUrl!;
+        a.download = task.fileName;
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
+      }, idx * 250);
+    });
+  };
+
+  const handleExportLog = () => {
+    triggerHaptic('tap');
+    const logData = transfers.map((t) => ({
+      id: t.id,
+      fileName: t.fileName,
+      fileSize: t.fileSize,
+      fileSizeFormatted: formatBytes(t.fileSize),
+      mimeType: t.mimeType,
+      direction: t.direction,
+      peerName: t.peerName,
+      status: t.status,
+      speedPeak: t.peakSpeed ? formatSpeed(t.peakSpeed) : undefined,
+      speedAverage: t.averageSpeed ? formatSpeed(t.averageSpeed) : undefined,
+      transportType: t.transportType,
+      encryptionMode: t.encryptionMode,
+      fingerprint: t.fingerprint,
+      startedAt: new Date(t.startedAt).toISOString(),
+      completedAt: t.completedAt ? new Date(t.completedAt).toISOString() : undefined,
+    }));
+
+    const blob = new Blob([JSON.stringify(logData, null, 2)], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `AetherDrop_TransferLog_${new Date().toISOString().slice(0, 10)}.json`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+  };
+
+  const openPreview = (task: TransferTask) => {
+    setPreviewItem({
+      name: task.fileName,
+      size: task.fileSize,
+      type: task.mimeType,
+      url: task.downloadUrl,
+      file: task.rawFile,
+    });
+    setIsPreviewOpen(true);
+  };
+
+  const openInspector = (task: TransferTask) => {
+    setInspectTask(task);
+    setIsInspectOpen(true);
+  };
 
   const getFileCategoryIcon = (mimeType: string, name: string) => {
     const category = getFileCategory(mimeType, name);
@@ -128,94 +243,155 @@ export const TransferList: React.FC<TransferListProps> = ({
   };
 
   return (
-    <div className="bg-white dark:bg-neutral-900 rounded-xl border border-neutral-200 dark:border-neutral-800 p-5 shadow-xs transition-colors">
-      {/* Header and Controls */}
-      <div className="flex flex-wrap items-center justify-between gap-3 pb-4 border-b border-neutral-100 dark:border-neutral-800/80">
-        <div>
-          <h2 className="text-base font-semibold text-neutral-900 dark:text-neutral-100">
-            Transfers Management
-          </h2>
-          <div className="flex items-center gap-2 text-xs text-neutral-500 dark:text-neutral-400 mt-0.5">
-            <span>{transfers.length} total tasks</span>
-            <span aria-hidden="true">·</span>
-            <span className="font-mono tabular-nums">{activeCount} active</span>
-            <span aria-hidden="true">·</span>
-            <span className="font-mono tabular-nums">{completedCount} finished</span>
+    <div className="bg-white dark:bg-neutral-900 rounded-2xl border border-neutral-200 dark:border-neutral-800 p-5 shadow-xs transition-colors space-y-4">
+      {/* Summary Metrics Banner */}
+      <div className="p-4 rounded-xl bg-neutral-50 dark:bg-neutral-850 border border-neutral-200/80 dark:border-neutral-800 flex flex-wrap items-center justify-between gap-4">
+        <div className="flex items-center gap-3">
+          <div className="w-10 h-10 rounded-xl bg-cyan-50 dark:bg-cyan-950/60 border border-cyan-200 dark:border-cyan-800 flex items-center justify-center text-cyan-600 dark:text-cyan-400">
+            <HardDrive className="w-5 h-5" />
+          </div>
+          <div>
+            <h3 className="text-sm font-bold text-neutral-900 dark:text-neutral-100">
+              Transfer History & Performance
+            </h3>
+            <div className="flex items-center gap-2 text-xs text-neutral-500 dark:text-neutral-400 mt-0.5 flex-wrap">
+              <span>{transfers.length} total tasks</span>
+              <span aria-hidden="true">·</span>
+              <span className="font-mono text-cyan-600 dark:text-cyan-400 font-semibold">{formatBytes(totalTransferredBytes)} moved</span>
+              <span aria-hidden="true">·</span>
+              <span className="font-mono">{completedCount} finished</span>
+            </div>
           </div>
         </div>
 
-        {/* Action and Filter strip */}
         <div className="flex items-center gap-2 flex-wrap">
-          {/* Segmented Filter Controls */}
-          <div className="flex items-center p-0.5 bg-neutral-100 dark:bg-neutral-800 rounded-lg text-xs font-medium">
+          {transfers.length > 0 && (
             <button
-              onClick={() => setFilter('all')}
-              className={`px-2.5 py-1 rounded-md transition-colors whitespace-nowrap ${
-                filter === 'all'
-                  ? 'bg-white dark:bg-neutral-700 text-neutral-900 dark:text-white shadow-2xs font-semibold'
-                  : 'text-neutral-600 dark:text-neutral-400 hover:text-neutral-900 dark:hover:text-white'
-              }`}
+              onClick={handleExportLog}
+              className="px-3 py-1.5 rounded-xl border border-neutral-200 dark:border-neutral-700 hover:bg-neutral-100 dark:hover:bg-neutral-800 text-xs font-semibold text-neutral-700 dark:text-neutral-300 flex items-center gap-1.5 transition-colors cursor-pointer"
+              title="Export complete transfer history as JSON log"
             >
-              All ({transfers.length})
+              <FileDown className="w-3.5 h-3.5" />
+              <span>Export Log</span>
             </button>
+          )}
+
+          {transfers.some((t) => t.status === 'completed' && t.downloadUrl && t.direction === 'receive') && (
             <button
-              onClick={() => setFilter('active')}
-              className={`px-2.5 py-1 rounded-md transition-colors whitespace-nowrap ${
-                filter === 'active'
-                  ? 'bg-white dark:bg-neutral-700 text-neutral-900 dark:text-white shadow-2xs font-semibold'
-                  : 'text-neutral-600 dark:text-neutral-400 hover:text-neutral-900 dark:hover:text-white'
-              }`}
+              onClick={handleDownloadAllCompleted}
+              className="px-3 py-1.5 rounded-xl bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-semibold flex items-center gap-1.5 shadow-2xs transition-colors cursor-pointer"
             >
-              Active ({activeCount})
+              <Download className="w-3.5 h-3.5" />
+              <span>Save All Received</span>
             </button>
-            <button
-              onClick={() => setFilter('completed')}
-              className={`px-2.5 py-1 rounded-md transition-colors whitespace-nowrap ${
-                filter === 'completed'
-                  ? 'bg-white dark:bg-neutral-700 text-neutral-900 dark:text-white shadow-2xs font-semibold'
-                  : 'text-neutral-600 dark:text-neutral-400 hover:text-neutral-900 dark:hover:text-white'
-              }`}
-            >
-              Completed ({completedCount})
-            </button>
-          </div>
+          )}
 
           {completedCount > 0 && (
             <button
               onClick={onClearCompleted}
-              className="text-xs px-2.5 py-1 text-neutral-500 hover:text-neutral-800 dark:hover:text-neutral-200 transition-colors"
+              className="px-3 py-1.5 rounded-xl border border-neutral-200 dark:border-neutral-700 hover:bg-neutral-100 dark:hover:bg-neutral-800 text-xs font-medium text-neutral-600 dark:text-neutral-400 transition-colors flex items-center gap-1 cursor-pointer"
             >
-              Clear Completed
+              <Trash2 className="w-3.5 h-3.5" />
+              <span>Clear Completed</span>
             </button>
           )}
         </div>
       </div>
 
+      {/* Filter and Search Bar */}
+      <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+        {/* Status segmented buttons */}
+        <div className="flex items-center p-1 bg-neutral-100 dark:bg-neutral-800 rounded-xl text-xs font-medium overflow-x-auto">
+          <button
+            onClick={() => setStatusFilter('all')}
+            className={`px-3 py-1.5 rounded-lg transition-colors whitespace-nowrap cursor-pointer ${
+              statusFilter === 'all'
+                ? 'bg-white dark:bg-neutral-700 text-neutral-900 dark:text-white shadow-2xs font-bold'
+                : 'text-neutral-600 dark:text-neutral-400 hover:text-neutral-900 dark:hover:text-white'
+            }`}
+          >
+            All ({transfers.length})
+          </button>
+          <button
+            onClick={() => setStatusFilter('active')}
+            className={`px-3 py-1.5 rounded-lg transition-colors whitespace-nowrap cursor-pointer ${
+              statusFilter === 'active'
+                ? 'bg-white dark:bg-neutral-700 text-neutral-900 dark:text-white shadow-2xs font-bold'
+                : 'text-neutral-600 dark:text-neutral-400 hover:text-neutral-900 dark:hover:text-white'
+            }`}
+          >
+            Active ({activeCount})
+          </button>
+          <button
+            onClick={() => setStatusFilter('completed')}
+            className={`px-3 py-1.5 rounded-lg transition-colors whitespace-nowrap cursor-pointer ${
+              statusFilter === 'completed'
+                ? 'bg-white dark:bg-neutral-700 text-neutral-900 dark:text-white shadow-2xs font-bold'
+                : 'text-neutral-600 dark:text-neutral-400 hover:text-neutral-900 dark:hover:text-white'
+            }`}
+          >
+            Completed ({completedCount})
+          </button>
+          <button
+            onClick={() => setStatusFilter('sent')}
+            className={`px-3 py-1.5 rounded-lg transition-colors whitespace-nowrap cursor-pointer ${
+              statusFilter === 'sent'
+                ? 'bg-white dark:bg-neutral-700 text-neutral-900 dark:text-white shadow-2xs font-bold'
+                : 'text-neutral-600 dark:text-neutral-400 hover:text-neutral-900 dark:hover:text-white'
+            }`}
+          >
+            Sent ({sentCount})
+          </button>
+          <button
+            onClick={() => setStatusFilter('received')}
+            className={`px-3 py-1.5 rounded-lg transition-colors whitespace-nowrap cursor-pointer ${
+              statusFilter === 'received'
+                ? 'bg-white dark:bg-neutral-700 text-neutral-900 dark:text-white shadow-2xs font-bold'
+                : 'text-neutral-600 dark:text-neutral-400 hover:text-neutral-900 dark:hover:text-white'
+            }`}
+          >
+            Received ({receivedCount})
+          </button>
+        </div>
+
+        {/* Search input */}
+        <div className="relative max-w-xs w-full">
+          <Search className="w-3.5 h-3.5 text-neutral-400 absolute left-3 top-1/2 -translate-y-1/2" />
+          <input
+            type="text"
+            value={searchQuery}
+            onChange={(e) => setSearchQuery(e.target.value)}
+            placeholder="Search filename or peer..."
+            className="w-full pl-8 pr-3 py-1.5 text-xs bg-neutral-100 dark:bg-neutral-800 border border-neutral-200 dark:border-neutral-700 rounded-xl text-neutral-900 dark:text-neutral-100 placeholder:text-neutral-400 focus:outline-hidden focus:ring-2 focus:ring-cyan-500"
+          />
+        </div>
+      </div>
+
       {/* Transfer Items List */}
-      <div className="mt-4 flex flex-col gap-3">
+      <div className="flex flex-col gap-3">
         {filteredTransfers.length === 0 ? (
           <div className="py-12 flex flex-col items-center justify-center text-center text-neutral-400 dark:text-neutral-500">
-            <div className="w-12 h-12 rounded-full bg-neutral-100 dark:bg-neutral-800 flex items-center justify-center mb-3">
+            <div className="w-12 h-12 rounded-2xl bg-neutral-100 dark:bg-neutral-800 flex items-center justify-center mb-3">
               <Zap className="w-5 h-5 text-neutral-400" />
             </div>
-            <p className="text-sm font-medium text-neutral-700 dark:text-neutral-300">
-              No transfers in this view
+            <p className="text-sm font-semibold text-neutral-700 dark:text-neutral-300">
+              No transfers match your criteria
             </p>
-            <p className="text-xs text-neutral-400 dark:text-neutral-500 mt-1">
-              Select or drop files above to start a secure peer-to-peer transmission.
+            <p className="text-xs text-neutral-400 dark:text-neutral-500 mt-1 max-w-xs">
+              Select or drop files on the Home screen to begin a fast, encrypted transfer.
             </p>
           </div>
         ) : (
           filteredTransfers.map((task) => (
             <div
               key={task.id}
-              className="group border border-neutral-200 dark:border-neutral-800/90 rounded-xl p-4 bg-neutral-50/40 dark:bg-neutral-900/60 hover:border-neutral-300 dark:hover:border-neutral-700 transition-all duration-200"
+              className="group border border-neutral-200 dark:border-neutral-800/90 rounded-2xl p-4 bg-neutral-50/40 dark:bg-neutral-900/60 hover:border-neutral-300 dark:hover:border-neutral-700 transition-all duration-200"
             >
               {/* Row 1: File Info & Controls */}
               <div className="flex items-start justify-between gap-3">
                 <div className="flex items-center gap-3 min-w-0">
                   <div
-                    className={`w-9 h-9 rounded-lg flex items-center justify-center shrink-0 ${
+                    className={`w-10 h-10 rounded-xl flex items-center justify-center shrink-0 ${
                       task.direction === 'send'
                         ? 'bg-cyan-50 dark:bg-cyan-950/60 text-cyan-600 dark:text-cyan-400'
                         : 'bg-emerald-50 dark:bg-emerald-950/60 text-emerald-600 dark:text-emerald-400'
@@ -235,15 +411,17 @@ export const TransferList: React.FC<TransferListProps> = ({
                         {task.fileName}
                       </h3>
                       {task.isEncrypted && (
-                        <span
+                        <button
+                          type="button"
+                          onClick={() => openInspector(task)}
                           title={`Encrypted with AES-256-GCM. Fingerprint: ${task.fingerprint || 'Verified'}`}
-                          className="shrink-0 text-emerald-600 dark:text-emerald-400"
+                          className="shrink-0 text-emerald-600 dark:text-emerald-400 hover:text-emerald-700 cursor-pointer"
                         >
                           <Lock className="w-3.5 h-3.5" />
-                        </span>
+                        </button>
                       )}
                     </div>
-                    <div className="flex items-center gap-2 text-xs text-neutral-500 dark:text-neutral-400 mt-0.5">
+                    <div className="flex items-center gap-2 text-xs text-neutral-500 dark:text-neutral-400 mt-0.5 flex-wrap">
                       <span>{task.direction === 'send' ? `To: ${task.peerName}` : `From: ${task.peerName}`}</span>
                       <span aria-hidden="true">·</span>
                       <span className="font-mono tabular-nums">{formatBytes(task.fileSize)}</span>
@@ -263,6 +441,28 @@ export const TransferList: React.FC<TransferListProps> = ({
                 <div className="flex items-center gap-2 shrink-0">
                   {getStatusBadge(task)}
 
+                  {/* Diagnostic Inspector Button */}
+                  <button
+                    type="button"
+                    onClick={() => openInspector(task)}
+                    className="p-1.5 rounded-lg border border-neutral-200 dark:border-neutral-700 hover:bg-neutral-100 dark:hover:bg-neutral-800 text-neutral-500 hover:text-cyan-600 transition-colors cursor-pointer"
+                    title="Inspect transfer diagnostics"
+                  >
+                    <Info className="w-3.5 h-3.5" />
+                  </button>
+
+                  {/* In-app preview button */}
+                  {(task.downloadUrl || task.rawFile) && (
+                    <button
+                      type="button"
+                      onClick={() => openPreview(task)}
+                      className="p-1.5 rounded-lg border border-neutral-200 dark:border-neutral-700 hover:bg-cyan-50 dark:hover:bg-cyan-950/40 text-neutral-500 hover:text-cyan-600 transition-colors cursor-pointer"
+                      title="Preview file"
+                    >
+                      <Eye className="w-3.5 h-3.5" />
+                    </button>
+                  )}
+
                   {/* Pause / Resume button */}
                   {(task.status === 'transferring' || task.status === 'paused') && (
                     <button
@@ -270,7 +470,7 @@ export const TransferList: React.FC<TransferListProps> = ({
                         task.status === 'paused' ? onResume(task.id) : onPause(task.id)
                       }
                       title={task.status === 'paused' ? 'Resume transfer' : 'Pause transfer'}
-                      className="p-1.5 rounded-lg border border-neutral-200 dark:border-neutral-700 hover:bg-neutral-100 dark:hover:bg-neutral-800 text-neutral-600 dark:text-neutral-300 transition-colors"
+                      className="p-1.5 rounded-lg border border-neutral-200 dark:border-neutral-700 hover:bg-neutral-100 dark:hover:bg-neutral-800 text-neutral-600 dark:text-neutral-300 transition-colors cursor-pointer"
                       aria-label={task.status === 'paused' ? 'Resume transfer' : 'Pause transfer'}
                     >
                       {task.status === 'paused' ? (
@@ -288,7 +488,7 @@ export const TransferList: React.FC<TransferListProps> = ({
                     <button
                       onClick={() => onCancel(task.id)}
                       title="Cancel transfer"
-                      className="p-1.5 rounded-lg border border-neutral-200 dark:border-neutral-700 hover:bg-rose-50 dark:hover:bg-rose-950/40 text-neutral-400 hover:text-rose-600 dark:hover:text-rose-400 transition-colors"
+                      className="p-1.5 rounded-lg border border-neutral-200 dark:border-neutral-700 hover:bg-rose-50 dark:hover:bg-rose-950/40 text-neutral-400 hover:text-rose-600 dark:hover:text-rose-400 transition-colors cursor-pointer"
                       aria-label="Cancel transfer"
                     >
                       <X className="w-3.5 h-3.5" />
@@ -300,7 +500,7 @@ export const TransferList: React.FC<TransferListProps> = ({
                     <a
                       href={task.downloadUrl}
                       download={task.fileName}
-                      className="px-2.5 py-1 rounded-md text-xs font-semibold bg-emerald-600 hover:bg-emerald-500 text-white flex items-center gap-1 shadow-2xs transition-colors"
+                      className="px-2.5 py-1 rounded-lg text-xs font-semibold bg-emerald-600 hover:bg-emerald-500 text-white flex items-center gap-1 shadow-2xs transition-colors"
                     >
                       <Download className="w-3.5 h-3.5" />
                       <span>Save</span>
@@ -328,7 +528,7 @@ export const TransferList: React.FC<TransferListProps> = ({
               </div>
 
               {/* Row 3: Real-time Metrics (Bytes, Speed, ETA) */}
-              <div className="mt-2 flex items-center justify-between text-xs text-neutral-500 dark:text-neutral-400 font-mono tabular-nums">
+              <div className="mt-2 flex items-center justify-between text-xs text-neutral-500 dark:text-neutral-400 font-mono tabular-nums flex-wrap gap-2">
                 <div className="flex items-center gap-2">
                   <span>
                     {formatBytes(task.bytesTransferred)} of {formatBytes(task.fileSize)}
@@ -354,6 +554,44 @@ export const TransferList: React.FC<TransferListProps> = ({
           ))
         )}
       </div>
+
+      {/* In-App File Preview Modal */}
+      <FilePreviewModal
+        isOpen={isPreviewOpen}
+        onClose={() => setIsPreviewOpen(false)}
+        item={previewItem}
+        onDownload={
+          previewItem?.url
+            ? () => {
+                const a = document.createElement('a');
+                a.href = previewItem.url!;
+                a.download = previewItem.name;
+                document.body.appendChild(a);
+                a.click();
+                document.body.removeChild(a);
+              }
+            : undefined
+        }
+      />
+
+      {/* Transfer Inspector Modal */}
+      <TransferInspectorModal
+        isOpen={isInspectOpen}
+        onClose={() => setIsInspectOpen(false)}
+        task={inspectTask}
+        onDownload={
+          inspectTask?.downloadUrl
+            ? () => {
+                const a = document.createElement('a');
+                a.href = inspectTask.downloadUrl!;
+                a.download = inspectTask.fileName;
+                document.body.appendChild(a);
+                a.click();
+                document.body.removeChild(a);
+              }
+            : undefined
+        }
+      />
     </div>
   );
 };
