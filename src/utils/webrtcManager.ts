@@ -59,9 +59,13 @@ export class WebRTCManager {
   private roomId: string;
   private callbacks: WebRTCManagerCallbacks;
 
-  // Real-time MQTT signaling client
+  // Real-time MQTT & HTTP Dual-Signaling clients
   private mqttClient: MqttClient | null = null;
   private localBroadcastChannel: BroadcastChannel | null = null;
+  private httpPollInterval: any = null;
+  private httpPeersPollInterval: any = null;
+  private httpHeartbeatInterval: any = null;
+  private seenPacketIds = new Set<string>();
 
   // WebRTC PeerConnections & Multi-Channel Striped DataChannels
   private peerConnections = new Map<string, RTCPeerConnection>();
@@ -121,6 +125,7 @@ export class WebRTCManager {
 
   public init() {
     this.initBroadcastChannel();
+    this.initHttpSignaling();
     this.initMqttSignaling();
     this.startPresenceHeartbeat();
     this.startPeerPruning();
@@ -129,8 +134,19 @@ export class WebRTCManager {
   public destroy() {
     if (this.presenceInterval) clearInterval(this.presenceInterval);
     if (this.pruneInterval) clearInterval(this.pruneInterval);
+    if (this.httpPollInterval) clearInterval(this.httpPollInterval);
+    if (this.httpPeersPollInterval) clearInterval(this.httpPeersPollInterval);
+    if (this.httpHeartbeatInterval) clearInterval(this.httpHeartbeatInterval);
 
     this.sendSignalingMessage('room', { type: 'PEER_LEAVE', peerId: this.selfPeer.id });
+
+    try {
+      fetch('/api/signal/leave', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ id: this.selfPeer.id }),
+      }).catch(() => {});
+    } catch {}
 
     if (this.mqttClient) {
       try {
@@ -174,6 +190,21 @@ export class WebRTCManager {
     this.peerHeartbeats.clear();
     this.broadcastPeersList();
 
+    // Re-register with local server under new room
+    fetch('/api/signal/register', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        id: this.selfPeer.id,
+        pin: this.selfPeer.pin,
+        name: this.selfPeer.name,
+        deviceType: this.selfPeer.deviceType,
+        browser: this.selfPeer.browser,
+        avatarColor: this.selfPeer.avatarColor,
+        roomId: this.roomId,
+      }),
+    }).catch(() => {});
+
     if (this.mqttClient && this.mqttClient.connected) {
       this.mqttClient.subscribe(`aetherdrop/rooms/${this.roomId}/broadcast`);
       this.announcePresence();
@@ -191,6 +222,86 @@ export class WebRTCManager {
     } catch (e) {
       console.warn('BroadcastChannel not supported:', e);
     }
+  }
+
+  // Guaranteed Local HTTP Signaling (Works 100% on Wi-Fi Hotspots & Offline LAN)
+  private initHttpSignaling() {
+    const registerSelf = () => {
+      fetch('/api/signal/register', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          id: this.selfPeer.id,
+          pin: this.selfPeer.pin,
+          name: this.selfPeer.name,
+          deviceType: this.selfPeer.deviceType,
+          browser: this.selfPeer.browser,
+          avatarColor: this.selfPeer.avatarColor,
+          roomId: this.roomId,
+        }),
+      })
+        .then((r) => r.json())
+        .then(() => {
+          this.callbacks.onSignalingStatus?.('connected', `Local Wi-Fi Network Ready (Room: ${this.roomId})`);
+        })
+        .catch(() => {});
+    };
+
+    registerSelf();
+
+    // 1. Fast message polling (every 350ms) for instant Offer/Answer/ICE candidate delivery
+    this.httpPollInterval = setInterval(async () => {
+      try {
+        const res = await fetch(`/api/signal/messages?peerId=${encodeURIComponent(this.selfPeer.id)}`);
+        if (!res.ok) return;
+        const data = await res.json();
+        if (data && Array.isArray(data.messages)) {
+          for (const item of data.messages) {
+            if (item && item.payload) {
+              await this.handleSignalingPacket(item.payload);
+            }
+          }
+        }
+      } catch {}
+    }, 350);
+
+    // 2. Discover local LAN peers every 2.5s
+    this.httpPeersPollInterval = setInterval(async () => {
+      try {
+        const res = await fetch(`/api/signal/peers?roomId=${encodeURIComponent(this.roomId)}&excludeId=${encodeURIComponent(this.selfPeer.id)}`);
+        if (!res.ok) return;
+        const data = await res.json();
+        if (data && Array.isArray(data.peers)) {
+          let updated = false;
+          for (const p of data.peers) {
+            if (p.id !== this.selfPeer.id) {
+              const prev = this.peers.get(p.id);
+              if (!prev || prev.name !== p.name || prev.pin !== p.pin) {
+                this.peers.set(p.id, {
+                  ...p,
+                  status: this.dataChannels.has(p.id) ? 'connected' : 'available',
+                  connectionType: 'webrtc-direct',
+                });
+                updated = true;
+              }
+              this.peerHeartbeats.set(p.id, Date.now());
+            }
+          }
+          if (updated) {
+            this.broadcastPeersList();
+          }
+        }
+      } catch {}
+    }, 2500);
+
+    // 3. Keep local presence active on server
+    this.httpHeartbeatInterval = setInterval(() => {
+      fetch('/api/signal/heartbeat', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ id: this.selfPeer.id }),
+      }).catch(() => {});
+    }, 5000);
   }
 
   private initMqttSignaling() {
@@ -234,47 +345,72 @@ export class WebRTCManager {
       });
 
       this.mqttClient.on('error', (err) => {
-        console.warn('[AetherDrop] Signaling broker error:', err);
-        this.callbacks.onSignalingStatus?.('offline', 'Signaling offline');
+        console.warn('[AetherDrop] MQTT broker status:', err?.message || 'offline');
       });
 
       this.mqttClient.on('offline', () => {
-        this.callbacks.onSignalingStatus?.('connecting', 'Reconnecting to network...');
+        // HTTP signaling keeps discovery completely operational even when MQTT is offline
       });
     } catch (err) {
-      console.warn('MQTT init failed:', err);
-      this.callbacks.onSignalingStatus?.('offline', 'Signaling offline');
+      console.warn('MQTT init skipped or failed:', err);
     }
   }
 
   private sendSignalingMessage(target: 'room' | { peerId?: string; pin?: string }, data: any) {
+    const msgId = 'msg_' + Math.random().toString(36).slice(2, 9) + '_' + Date.now();
     const packet = {
       ...data,
+      msgId,
       sender: this.selfPeer,
       timestamp: Date.now(),
     };
 
+    // Deduplicate self-sent broadcast
+    this.seenPacketIds.add(msgId);
+
+    // 1. Same-device tab communication via BroadcastChannel
     try {
       this.localBroadcastChannel?.postMessage(packet);
     } catch {}
 
+    // 2. High-speed local HTTP signaling (Guaranteed across all tethered devices)
+    const targetId = target === 'room' ? 'room' : target.peerId;
+    const targetPin = typeof target === 'object' ? target.pin : undefined;
+    try {
+      fetch('/api/signal/send', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          senderId: this.selfPeer.id,
+          targetId: targetId || (targetPin ? undefined : 'room'),
+          targetPin,
+          roomId: this.roomId,
+          type: packet.type,
+          payload: packet,
+        }),
+      }).catch(() => {});
+    } catch {}
+
+    // 3. MQTT Broker (WAN fallback)
     if (this.mqttClient && this.mqttClient.connected) {
-      if (target === 'room') {
-        this.mqttClient.publish(
-          `aetherdrop/rooms/${this.roomId}/broadcast`,
-          JSON.stringify(packet)
-        );
-      } else if (target.peerId) {
-        this.mqttClient.publish(
-          `aetherdrop/peers/${target.peerId}/inbox`,
-          JSON.stringify(packet)
-        );
-      } else if (target.pin) {
-        this.mqttClient.publish(
-          `aetherdrop/pins/${target.pin}/inbox`,
-          JSON.stringify(packet)
-        );
-      }
+      try {
+        if (target === 'room') {
+          this.mqttClient.publish(
+            `aetherdrop/rooms/${this.roomId}/broadcast`,
+            JSON.stringify(packet)
+          );
+        } else if (target.peerId) {
+          this.mqttClient.publish(
+            `aetherdrop/peers/${target.peerId}/inbox`,
+            JSON.stringify(packet)
+          );
+        } else if (target.pin) {
+          this.mqttClient.publish(
+            `aetherdrop/pins/${target.pin}/inbox`,
+            JSON.stringify(packet)
+          );
+        }
+      } catch {}
     }
   }
 
@@ -296,7 +432,7 @@ export class WebRTCManager {
       const now = Date.now();
       let changed = false;
       for (const [id, lastTime] of this.peerHeartbeats.entries()) {
-        if (now - lastTime > 8000) {
+        if (now - lastTime > 12000) {
           this.peers.delete(id);
           this.peerHeartbeats.delete(id);
           changed = true;
@@ -334,6 +470,26 @@ export class WebRTCManager {
       return;
     }
 
+    // Packet Deduplication: Handles dual routes (HTTP and MQTT/BroadcastChannel) seamlessly
+    const packetId = packet.msgId || (
+      packet.sender.id + '_' +
+      packet.type + '_' +
+      (packet.timestamp || '') + '_' +
+      (packet.sdp?.type || packet.candidate?.candidate || packet.payload?.transferId || packet.transferId || '')
+    );
+
+    if (this.seenPacketIds.has(packetId)) {
+      return;
+    }
+    this.seenPacketIds.add(packetId);
+    if (this.seenPacketIds.size > 2000) {
+      const iter = this.seenPacketIds.values();
+      for (let i = 0; i < 800; i++) {
+        const v = iter.next().value;
+        if (v) this.seenPacketIds.delete(v);
+      }
+    }
+
     const { type, sender } = packet;
 
     if (type === 'PEER_PRESENCE') {
@@ -356,10 +512,16 @@ export class WebRTCManager {
     } else if (type === 'ANSWER') {
       const pc = this.peerConnections.get(sender.id);
       if (pc) {
-        const rawSdp = packet.sdp?.sdp || packet.sdp;
-        const uncapped = uncapSdpBandwidth(rawSdp);
-        await pc.setRemoteDescription(new RTCSessionDescription({ type: 'answer', sdp: uncapped }));
-        await this.flushPendingCandidates(sender.id, pc);
+        try {
+          const rawSdp = packet.sdp?.sdp || packet.sdp;
+          const uncapped = uncapSdpBandwidth(rawSdp);
+          if (pc.signalingState === 'have-local-offer') {
+            await pc.setRemoteDescription(new RTCSessionDescription({ type: 'answer', sdp: uncapped }));
+            await this.flushPendingCandidates(sender.id, pc);
+          }
+        } catch (err) {
+          console.warn('[AetherDrop] Failed to set remote answer:', err);
+        }
       }
     } else if (type === 'ICE_CANDIDATE') {
       const pc = this.peerConnections.get(sender.id);
@@ -406,20 +568,26 @@ export class WebRTCManager {
     }
 
     return new Promise((resolve, reject) => {
+      // Extended 25-second timeout with informative error message
       const timeout = setTimeout(() => {
-        reject(new Error('Connection timed out. Peer may be unreachable.'));
-      }, 8000);
+        const waiters = this.dataChannelWaiters.get(targetPeerId) || [];
+        this.dataChannelWaiters.set(targetPeerId, waiters.filter((w) => w !== resolveWait));
+        reject(new Error('Connection timed out (25s). Ensure both devices are on the same Wi-Fi / Hotspot and scan QR code or enter PIN.'));
+      }, 25000);
+
+      const resolveWait = (dc: RTCDataChannel) => {
+        clearTimeout(timeout);
+        resolve(dc);
+      };
 
       if (!this.dataChannelWaiters.has(targetPeerId)) {
         this.dataChannelWaiters.set(targetPeerId, []);
       }
+      this.dataChannelWaiters.get(targetPeerId)!.push(resolveWait);
 
-      this.dataChannelWaiters.get(targetPeerId)!.push((dc) => {
-        clearTimeout(timeout);
-        resolve(dc);
+      this.initiateWebRTCConnection(targetPeerId, true).catch((err) => {
+        console.warn('[AetherDrop] initiateWebRTCConnection error:', err);
       });
-
-      this.initiateWebRTCConnection(targetPeerId, true);
     });
   }
 
@@ -475,9 +643,25 @@ export class WebRTCManager {
       return;
     }
 
+    const existingPc = this.peerConnections.get(targetPeerId);
+    if (existingPc) {
+      // If already in flight, don't destroy connection unless it has failed or closed
+      if (
+        (existingPc.signalingState === 'have-local-offer' || existingPc.connectionState === 'connecting') &&
+        existingPc.connectionState !== 'failed' &&
+        existingPc.connectionState !== 'closed'
+      ) {
+        return;
+      }
+      try { existingPc.close(); } catch {}
+      this.peerConnections.delete(targetPeerId);
+    }
+
     const iceServers = [
       { urls: 'stun:stun.l.google.com:19302' },
       { urls: 'stun:stun1.l.google.com:19302' },
+      { urls: 'stun:stun.cloudflare.com:3478' },
+      { urls: 'stun:stun.services.mozilla.com' },
     ];
 
     const pc = new RTCPeerConnection({
@@ -486,6 +670,13 @@ export class WebRTCManager {
     });
 
     this.peerConnections.set(targetPeerId, pc);
+
+    pc.oniceconnectionstatechange = () => {
+      console.log(`[AetherDrop] ICE state with ${targetPeerId}:`, pc.iceConnectionState);
+      if (pc.iceConnectionState === 'failed') {
+        try { pc.restartIce(); } catch {}
+      }
+    };
 
     pc.onicecandidate = (event) => {
       if (event.candidate) {
@@ -526,10 +717,28 @@ export class WebRTCManager {
 
   private async handleWebRTCOffer(senderId: string, sdp: RTCSessionDescriptionInit) {
     let pc = this.peerConnections.get(senderId);
-    if (!pc) {
+    const isPolite = this.selfPeer.id.localeCompare(senderId) > 0;
+
+    if (pc) {
+      // Glare Collision Handling (Perfect Negotiation)
+      if (pc.signalingState !== 'stable') {
+        if (!isPolite) {
+          console.log('[AetherDrop] Glare collision: Impolite peer ignoring duplicate incoming offer');
+          return;
+        }
+        console.log('[AetherDrop] Glare collision: Polite peer rolling back to handle remote offer');
+        try {
+          await pc.setLocalDescription({ type: 'rollback' });
+        } catch (e) {
+          console.warn('Rollback failed:', e);
+        }
+      }
+    } else {
       const iceServers = [
         { urls: 'stun:stun.l.google.com:19302' },
         { urls: 'stun:stun1.l.google.com:19302' },
+        { urls: 'stun:stun.cloudflare.com:3478' },
+        { urls: 'stun:stun.services.mozilla.com' },
       ];
 
       pc = new RTCPeerConnection({
@@ -537,6 +746,13 @@ export class WebRTCManager {
         iceCandidatePoolSize: 10,
       });
       this.peerConnections.set(senderId, pc);
+
+      pc.oniceconnectionstatechange = () => {
+        console.log(`[AetherDrop] Receiver ICE state with ${senderId}:`, pc!.iceConnectionState);
+        if (pc!.iceConnectionState === 'failed') {
+          try { pc!.restartIce(); } catch {}
+        }
+      };
 
       pc.onicecandidate = (event) => {
         if (event.candidate) {
@@ -758,6 +974,70 @@ export class WebRTCManager {
     }
 
     return transferId;
+  }
+
+  // Retry failed transfer on-demand without re-selecting files
+  public async retryTransfer(transferId: string): Promise<void> {
+    const task = this.activeTransfers.get(transferId);
+    if (!task || task.direction !== 'send' || !task.rawFile) {
+      return;
+    }
+
+    task.status = 'transferring';
+    task.bytesTransferred = 0;
+    task.progress = 0;
+    task.speed = 0;
+    task.errorReason = undefined;
+    task.updatedAt = Date.now();
+    this.speedTrackers.set(transferId, { lastBytes: 0, lastTime: Date.now() });
+    this.notifyTransferProgress(task, true);
+    playStartTone();
+
+    try {
+      const dc = await this.ensureDataChannelConnected(task.peerId);
+      const totalChunks = Math.ceil(task.rawFile.size / CHUNK_SIZE);
+      const mode = task.encryptionMode;
+      let rawKey: ArrayBuffer | undefined;
+      if (task.chunkKey) {
+        rawKey = await exportKeyRaw(task.chunkKey);
+      }
+
+      const offer = {
+        type: 'FILE_OFFER',
+        transferId: task.id,
+        fileName: task.fileName,
+        fileSize: task.fileSize,
+        mimeType: task.mimeType,
+        totalChunks,
+        encryptionMode: mode,
+        isTetherMode: this.isTetherMode,
+        rawKey: rawKey ? Array.from(new Uint8Array(rawKey)) : undefined,
+        fingerprint: task.fingerprint,
+      };
+
+      const acceptPromise = new Promise<boolean>((resolve) => {
+        const timer = setTimeout(() => resolve(true), 2500);
+        this.fileAcceptWaiters.set(task.id, (acc) => {
+          clearTimeout(timer);
+          resolve(acc);
+        });
+      });
+
+      dc.send(JSON.stringify(offer));
+      this.sendSignalingMessage({ peerId: task.peerId }, {
+        type: 'FILE_OFFER_SIGNAL',
+        payload: offer,
+      });
+
+      await acceptPromise;
+      await this.streamFileChunks(task, task.rawFile, task.chunkKey, task.peerId, dc);
+    } catch (err: any) {
+      console.error('Retry file failed:', err);
+      task.status = 'error';
+      task.errorReason = err?.message || 'Failed to establish peer connection';
+      this.notifyTransferProgress(task, true);
+      playErrorTone();
+    }
   }
 
   // Maximum Local Wi-Fi Throughput Binary Streaming Engine (25 - 60+ MB/s)

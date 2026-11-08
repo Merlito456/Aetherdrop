@@ -26,6 +26,7 @@ app.use(express.json({ limit: '1mb' }));
 // In-memory peer signaling store (never stores any file data!)
 interface PeerInfo {
   id: string;
+  pin: string;
   name: string;
   deviceType: 'desktop' | 'mobile' | 'tablet';
   browser: string;
@@ -46,11 +47,11 @@ interface SignalMessage {
 const peers = new Map<string, PeerInfo>();
 const messageQueues = new Map<string, SignalMessage[]>();
 
-// Prune inactive peers every 10 seconds
+// Prune inactive peers every 15 seconds
 setInterval(() => {
   const now = Date.now();
   for (const [id, peer] of peers.entries()) {
-    if (now - peer.lastSeen > 20000) {
+    if (now - peer.lastSeen > 25000) {
       peers.delete(id);
       messageQueues.delete(id);
     }
@@ -59,13 +60,14 @@ setInterval(() => {
 
 // API Routes for WebRTC Signaling & Local Peer Discovery
 app.post('/api/signal/register', (req, res) => {
-  const { id, name, deviceType, browser, avatarColor, roomId } = req.body;
+  const { id, pin, name, deviceType, browser, avatarColor, roomId } = req.body;
   if (!id || !name) {
     res.status(400).json({ error: 'Missing required peer fields' });
     return;
   }
   peers.set(id, {
     id,
+    pin: pin || '',
     name,
     deviceType: deviceType || 'desktop',
     browser: browser || 'Unknown',
@@ -95,9 +97,10 @@ app.get('/api/signal/peers', (req, res) => {
   const now = Date.now();
 
   const peerList = Array.from(peers.values())
-    .filter(p => p.roomId === roomId && p.id !== excludeId && (now - p.lastSeen < 20000))
-    .map(({ id, name, deviceType, browser, avatarColor }) => ({
+    .filter(p => p.roomId === roomId && p.id !== excludeId && (now - p.lastSeen < 25000))
+    .map(({ id, pin, name, deviceType, browser, avatarColor }) => ({
       id,
+      pin,
       name,
       deviceType,
       browser,
@@ -108,27 +111,47 @@ app.get('/api/signal/peers', (req, res) => {
 });
 
 app.post('/api/signal/send', (req, res) => {
-  const { senderId, targetId, type, payload } = req.body;
-  if (!senderId || !targetId || !type) {
-    res.status(400).json({ error: 'Invalid signal payload' });
+  const { senderId, targetId, targetPin, roomId, type, payload, data } = req.body;
+  if (!senderId) {
+    res.status(400).json({ error: 'Invalid signal payload: missing senderId' });
     return;
   }
 
-  const targetQueue = messageQueues.get(targetId);
-  if (!targetQueue) {
-    messageQueues.set(targetId, []);
-  }
-
+  const packet = data || payload || req.body;
   const msg: SignalMessage = {
     id: Math.random().toString(36).slice(2, 10),
     senderId,
-    targetId,
-    type,
-    payload,
+    targetId: targetId || '',
+    type: type || packet.type || 'SIGNAL',
+    payload: packet,
     timestamp: Date.now(),
   };
 
-  messageQueues.get(targetId)?.push(msg);
+  // Route to target peer by PIN
+  if (targetPin) {
+    for (const [id, peer] of peers.entries()) {
+      if (peer.pin === targetPin && id !== senderId) {
+        if (!messageQueues.has(id)) messageQueues.set(id, []);
+        messageQueues.get(id)!.push(msg);
+      }
+    }
+  } else if (targetId === 'room' || !targetId) {
+    // Room broadcast
+    const currentRoom = roomId || 'default-lan';
+    for (const [id, peer] of peers.entries()) {
+      if (peer.roomId === currentRoom && id !== senderId) {
+        if (!messageQueues.has(id)) messageQueues.set(id, []);
+        messageQueues.get(id)!.push(msg);
+      }
+    }
+  } else {
+    // Direct peer delivery
+    if (!messageQueues.has(targetId)) {
+      messageQueues.set(targetId, []);
+    }
+    messageQueues.get(targetId)!.push(msg);
+  }
+
   res.json({ success: true });
 });
 

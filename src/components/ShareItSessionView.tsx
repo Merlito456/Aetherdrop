@@ -20,6 +20,7 @@ import {
   FileText,
   FileArchive,
   Code,
+  RotateCcw,
 } from 'lucide-react';
 import { TransferTask, Peer } from '../types/transfer';
 import { formatBytes, formatSpeed, formatETA, getFileCategory } from '../utils/formatters';
@@ -34,6 +35,7 @@ interface ShareItSessionViewProps {
   onPause: (id: string) => void;
   onResume: (id: string) => void;
   onCancel: (id: string) => void;
+  onRetry?: (id: string) => void;
   onSendMore: () => void;
   onExitSession: () => void;
 }
@@ -48,6 +50,7 @@ export const ShareItSessionView: React.FC<ShareItSessionViewProps> = ({
   onPause,
   onResume,
   onCancel,
+  onRetry,
   onSendMore,
   onExitSession,
 }) => {
@@ -367,10 +370,22 @@ export const ShareItSessionView: React.FC<ShareItSessionViewProps> = ({
                   ) : task.status === 'cancelled' ? (
                     <span className="text-xs text-neutral-400 font-medium">Cancelled</span>
                   ) : task.status === 'error' ? (
-                    <span className="text-xs text-rose-500 font-medium flex items-center gap-1">
-                      <AlertCircle className="w-3.5 h-3.5" />
-                      <span>{task.errorReason || 'Failed'}</span>
-                    </span>
+                    <div className="flex items-center gap-2">
+                      <span className="text-xs text-rose-500 font-medium flex items-center gap-1 max-w-[180px] sm:max-w-xs truncate" title={task.errorReason || 'Failed'}>
+                        <AlertCircle className="w-3.5 h-3.5 shrink-0" />
+                        <span className="truncate">{task.errorReason || 'Failed'}</span>
+                      </span>
+                      {onRetry && task.direction === 'send' && task.rawFile && (
+                        <button
+                          onClick={() => onRetry(task.id)}
+                          className="px-2.5 py-1 bg-cyan-600 hover:bg-cyan-500 text-white rounded-lg text-xs font-bold transition-colors flex items-center gap-1 shadow-2xs shrink-0"
+                          title="Retry file transfer"
+                        >
+                          <RotateCcw className="w-3 h-3" />
+                          <span>Retry</span>
+                        </button>
+                      )}
+                    </div>
                   ) : (
                     <div className="flex items-center gap-1.5">
                       <button

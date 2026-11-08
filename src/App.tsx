@@ -262,6 +262,10 @@ export default function App() {
     managerRef.current?.cancelTransfer(id);
   };
 
+  const handleRetry = (id: string) => {
+    managerRef.current?.retryTransfer(id);
+  };
+
   const handleClearCompleted = () => {
     setTransfers((prev) => prev.filter((t) => t.status !== 'completed' && t.status !== 'cancelled'));
   };
@@ -423,6 +427,7 @@ export default function App() {
             onPause={handlePause}
             onResume={handleResume}
             onCancel={handleCancel}
+            onRetry={handleRetry}
             onSendMore={handleStartSend}
             onExitSession={() => setCurrentView('home')}
           />
