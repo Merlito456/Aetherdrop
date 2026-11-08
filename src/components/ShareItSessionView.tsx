@@ -220,7 +220,7 @@ export const ShareItSessionView: React.FC<ShareItSessionViewProps> = ({
                       isTetherMode ? 'text-cyan-600 dark:text-cyan-400' : 'text-neutral-400'
                     }`}
                   >
-                    {isTetherMode ? '16 MB Socket' : '8 MB Socket'}
+                    {isTetherMode ? 'Hotspot Direct' : 'Standard LAN'}
                   </span>
                 </div>
               </label>
@@ -286,7 +286,7 @@ export const ShareItSessionView: React.FC<ShareItSessionViewProps> = ({
                       )}
                       {(task.isTetherMode || isTetherMode) && (
                         <span
-                          title="1-Hop Direct Wi-Fi Tether Hotspot Mode Active (16 MB Socket)"
+                          title="1-Hop Direct Wi-Fi Tether Hotspot Active (Local Host ICE Routing)"
                           className="flex items-center gap-1 text-[10px] font-mono text-cyan-600 dark:text-cyan-400 bg-cyan-50 dark:bg-cyan-950/60 px-1.5 py-0.5 rounded border border-cyan-200 dark:border-cyan-800"
                         >
                           <Zap className="w-3 h-3 text-cyan-500" />

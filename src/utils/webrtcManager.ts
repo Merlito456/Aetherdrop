@@ -20,6 +20,9 @@ function uncapSdpBandwidth(sdpStr: string): string {
   const bitrateKbps = 2000000; // 2,000,000 kbps (2 Gbps)
   const bitrateBps = bitrateKbps * 1000;
 
+  // Normalize line endings to \r\n
+  sdp = sdp.replace(/\r?\n/g, '\r\n');
+
   // 1. Strip existing b=AS or b=TIAS lines
   sdp = sdp.replace(/b=AS:[^\r\n]*\r\n/g, '');
   sdp = sdp.replace(/b=TIAS:[^\r\n]*\r\n/g, '');
@@ -27,17 +30,21 @@ function uncapSdpBandwidth(sdpStr: string): string {
   // 2. Add session-level b=AS and b=TIAS right after connection information
   sdp = sdp.replace(/(c=IN[^\r\n]*\r\n)/g, `$1b=AS:${bitrateKbps}\r\nb=TIAS:${bitrateBps}\r\n`);
 
-  // 3. Add media-level b=AS and b=TIAS for application channels (SCTP DataChannel)
-  sdp = sdp.replace(/(m=application[^\r\n]*\r\n)/g, `$1b=AS:${bitrateKbps}\r\nb=TIAS:${bitrateBps}\r\n`);
+  // 3. Add media-level b=AS, b=TIAS, and advertise 256KB max message size for SCTP
+  sdp = sdp.replace(
+    /(m=application[^\r\n]*\r\n)/g,
+    `$1b=AS:${bitrateKbps}\r\nb=TIAS:${bitrateBps}\r\na=max-message-size:262144\r\n`
+  );
 
   return sdp;
 }
 
-// Tuned for Maximum Unlimited Local Wi-Fi Throughput (25 - 60+ MB/s / 200 - 500+ Mbps)
-const CHUNK_SIZE = 64 * 1024; // 64 KB per chunk (optimal SCTP frame size without MTU fragmentation)
-const BLOCK_READ_SIZE = 8 * 1024 * 1024; // 8 MB bulk disk/memory slice buffer
-const MAX_BUFFERED_AMOUNT = 8 * 1024 * 1024; // 8 MB pipeline window ceiling
-const BUFFER_LOW_THRESHOLD = 2 * 1024 * 1024; // 2 MB resume threshold
+// Tuned for Maximum Stability & High-Speed Local Wi-Fi Throughput
+// 32 KB chunk size guarantees safe delivery without exceeding the WebRTC 64KB SCTP max-message limit (which previously caused transfers to freeze at 64 KB!)
+const CHUNK_SIZE = 32 * 1024; // 32 KB per chunk
+const BLOCK_READ_SIZE = 4 * 1024 * 1024; // 4 MB bulk disk/memory slice buffer
+const MAX_BUFFERED_AMOUNT = 1024 * 1024; // 1 MB backpressure pipeline window
+const BUFFER_LOW_THRESHOLD = 256 * 1024; // 256 KB resume threshold
 
 export interface WebRTCManagerCallbacks {
   onPeersUpdated: (peers: Peer[]) => void;
@@ -61,6 +68,7 @@ export class WebRTCManager {
   private dataChannels = new Map<string, RTCDataChannel>();
   private dataChannelWaiters = new Map<string, Array<(dc: RTCDataChannel) => void>>();
   private fileAcceptWaiters = new Map<string, (accepted: boolean) => void>();
+  private pendingIceCandidates = new Map<string, RTCIceCandidateInit[]>();
 
   // Peers & Active Transfers
   private peers = new Map<string, Peer>();
@@ -343,14 +351,23 @@ export class WebRTCManager {
         const rawSdp = packet.sdp?.sdp || packet.sdp;
         const uncapped = uncapSdpBandwidth(rawSdp);
         await pc.setRemoteDescription(new RTCSessionDescription({ type: 'answer', sdp: uncapped }));
+        await this.flushPendingCandidates(sender.id, pc);
       }
     } else if (type === 'ICE_CANDIDATE') {
       const pc = this.peerConnections.get(sender.id);
-      if (pc && packet.candidate) {
-        try {
-          await pc.addIceCandidate(new RTCIceCandidate(packet.candidate));
-        } catch (e) {
-          console.warn('Failed to add ICE candidate:', e);
+      if (packet.candidate) {
+        if (pc && pc.remoteDescription && pc.remoteDescription.type) {
+          try {
+            await pc.addIceCandidate(new RTCIceCandidate(packet.candidate));
+          } catch (e) {
+            console.warn('Failed to add ICE candidate:', e);
+          }
+        } else {
+          // Queue candidate until remote description is set (essential for tether host candidate arrival)
+          if (!this.pendingIceCandidates.has(sender.id)) {
+            this.pendingIceCandidates.set(sender.id, []);
+          }
+          this.pendingIceCandidates.get(sender.id)!.push(packet.candidate);
         }
       }
     } else if (type === 'FILE_OFFER_SIGNAL') {
@@ -398,22 +415,66 @@ export class WebRTCManager {
     });
   }
 
+  private async flushPendingCandidates(peerId: string, pc: RTCPeerConnection) {
+    const list = this.pendingIceCandidates.get(peerId);
+    if (list && list.length > 0) {
+      for (const cand of list) {
+        try {
+          await pc.addIceCandidate(new RTCIceCandidate(cand));
+        } catch (e) {
+          console.warn('Failed to add queued ICE candidate:', e);
+        }
+      }
+      this.pendingIceCandidates.delete(peerId);
+    }
+  }
+
+  private async waitForDataChannelBuffer(dc: RTCDataChannel, maxBuffered: number): Promise<void> {
+    if (dc.bufferedAmount <= maxBuffered || dc.readyState !== 'open') {
+      return;
+    }
+
+    return new Promise<void>((resolve) => {
+      let resolved = false;
+      let pollInterval: any = null;
+
+      const finish = () => {
+        if (!resolved) {
+          resolved = true;
+          if (pollInterval) clearInterval(pollInterval);
+          dc.removeEventListener('bufferedamountlow', finish);
+          dc.removeEventListener('close', finish);
+          dc.removeEventListener('error', finish);
+          resolve();
+        }
+      };
+
+      dc.addEventListener('bufferedamountlow', finish, { once: true });
+      dc.addEventListener('close', finish, { once: true });
+      dc.addEventListener('error', finish, { once: true });
+
+      // Fallback polling every 10ms to ensure continuous data flow
+      pollInterval = setInterval(() => {
+        if (dc.bufferedAmount <= (dc.bufferedAmountLowThreshold || BUFFER_LOW_THRESHOLD) || dc.readyState !== 'open') {
+          finish();
+        }
+      }, 10);
+    });
+  }
+
   public async initiateWebRTCConnection(targetPeerId: string, isInitiator: boolean = true) {
     if (this.dataChannels.has(targetPeerId) && this.dataChannels.get(targetPeerId)!.readyState === 'open') {
       return;
     }
 
-    const iceServers = this.isTetherMode
-      ? [{ urls: 'stun:stun.l.google.com:19302' }]
-      : [
-          { urls: 'stun:stun.l.google.com:19302' },
-          { urls: 'stun:stun1.l.google.com:19302' },
-          { urls: 'stun:global.stun.twilio.com:3478' },
-        ];
+    const iceServers = [
+      { urls: 'stun:stun.l.google.com:19302' },
+      { urls: 'stun:stun1.l.google.com:19302' },
+    ];
 
     const pc = new RTCPeerConnection({
       iceServers,
-      iceCandidatePoolSize: this.isTetherMode ? 4 : 10,
+      iceCandidatePoolSize: 10,
     });
 
     this.peerConnections.set(targetPeerId, pc);
@@ -431,7 +492,7 @@ export class WebRTCManager {
 
     if (isInitiator) {
       const dc = pc.createDataChannel('aetherdrop_transfer', {
-        ordered: false, // Eliminates SCTP head-of-line blocking for maximum Wi-Fi throughput
+        ordered: true, // Guarantees in-order chunk delivery & prevents corrupt early completion
       });
       this.setupDataChannel(targetPeerId, dc);
 
@@ -454,17 +515,14 @@ export class WebRTCManager {
   private async handleWebRTCOffer(senderId: string, sdp: RTCSessionDescriptionInit) {
     let pc = this.peerConnections.get(senderId);
     if (!pc) {
-      const iceServers = this.isTetherMode
-        ? [{ urls: 'stun:stun.l.google.com:19302' }]
-        : [
-            { urls: 'stun:stun.l.google.com:19302' },
-            { urls: 'stun:stun1.l.google.com:19302' },
-            { urls: 'stun:global.stun.twilio.com:3478' },
-          ];
+      const iceServers = [
+        { urls: 'stun:stun.l.google.com:19302' },
+        { urls: 'stun:stun1.l.google.com:19302' },
+      ];
 
       pc = new RTCPeerConnection({
         iceServers,
-        iceCandidatePoolSize: this.isTetherMode ? 4 : 10,
+        iceCandidatePoolSize: 10,
       });
       this.peerConnections.set(senderId, pc);
 
@@ -486,6 +544,8 @@ export class WebRTCManager {
 
     const uncappedRemoteSdp = uncapSdpBandwidth(sdp.sdp || (sdp as any));
     await pc.setRemoteDescription(new RTCSessionDescription({ type: sdp.type, sdp: uncappedRemoteSdp }));
+    await this.flushPendingCandidates(senderId, pc);
+
     const answer = await pc.createAnswer();
     const uncappedAnswerSdp = uncapSdpBandwidth(answer.sdp || '');
     const answerDesc = new RTCSessionDescription({ type: answer.type, sdp: uncappedAnswerSdp });
@@ -656,7 +716,7 @@ export class WebRTCManager {
 
       await acceptPromise;
 
-      this.streamFileChunks(task, file, key, targetPeer.id, dc);
+      await this.streamFileChunks(task, file, key, targetPeer.id, dc);
     } catch (err: any) {
       console.error('Send file failed:', err);
       task.status = 'error';
@@ -691,9 +751,13 @@ export class WebRTCManager {
       let blockBuffer: ArrayBuffer | null = null;
 
       for (let chunkIdx = 0; chunkIdx < totalChunks; chunkIdx++) {
-        // Dynamically query tether mode so toggling checkbox mid-transfer takes effect immediately
-        const activeBlockSize = this.isTetherMode ? 16 * 1024 * 1024 : BLOCK_READ_SIZE;
-        const activeMaxBuffer = this.isTetherMode ? 16 * 1024 * 1024 : MAX_BUFFERED_AMOUNT;
+        if (dc.readyState !== 'open') {
+          throw new Error(`DataChannel closed unexpectedly (state: ${dc.readyState})`);
+        }
+
+        // Dynamically query tether mode
+        const activeBlockSize = this.isTetherMode ? 8 * 1024 * 1024 : BLOCK_READ_SIZE;
+        const activeMaxBuffer = this.isTetherMode ? 2 * 1024 * 1024 : MAX_BUFFERED_AMOUNT;
 
         if (this.cancelledTransfers.has(task.id)) {
           task.status = 'cancelled';
@@ -718,7 +782,7 @@ export class WebRTCManager {
         const chunkEnd = Math.min(chunkStart + CHUNK_SIZE, file.size);
         const chunkSize = chunkEnd - chunkStart;
 
-        // Bulk memory prefetch (8 MB or 16 MB in tether mode) to eliminate disk contention
+        // Bulk memory prefetch (4 MB or 8 MB in tether mode) to eliminate disk contention
         if (!blockBuffer || chunkStart >= blockStart + activeBlockSize) {
           blockStart = chunkStart;
           const blockEnd = Math.min(blockStart + activeBlockSize, file.size);
@@ -736,23 +800,13 @@ export class WebRTCManager {
           // Zero-copy typed array view over blockBuffer
           packet.set(new Uint8Array(blockBuffer, offsetInBlock, chunkSize), 4);
 
-          // SCTP Pipeline Backpressure: Wait only when DataChannel buffer hits activeMaxBuffer
+          // Pipelined SCTP Backpressure: Pause only when buffer exceeds safe window
           if (dc.bufferedAmount > activeMaxBuffer) {
-            await new Promise<void>((resolve) => {
-              let resolved = false;
-              const done = () => {
-                if (!resolved) {
-                  resolved = true;
-                  dc.removeEventListener('bufferedamountlow', done);
-                  resolve();
-                }
-              };
-              const timer = setTimeout(done, 30);
-              dc.addEventListener('bufferedamountlow', () => {
-                clearTimeout(timer);
-                done();
-              }, { once: true });
-            });
+            await this.waitForDataChannelBuffer(dc, activeMaxBuffer);
+          }
+
+          if (dc.readyState !== 'open') {
+            throw new Error(`DataChannel closed unexpectedly (state: ${dc.readyState})`);
           }
 
           dc.send(packet.buffer);
@@ -768,22 +822,12 @@ export class WebRTCManager {
           packet.set(iv, 4);
           packet.set(new Uint8Array(encrypted), 16);
 
-          if (dc.bufferedAmount > MAX_BUFFERED_AMOUNT) {
-            await new Promise<void>((resolve) => {
-              let resolved = false;
-              const done = () => {
-                if (!resolved) {
-                  resolved = true;
-                  dc.removeEventListener('bufferedamountlow', done);
-                  resolve();
-                }
-              };
-              const timer = setTimeout(done, 30);
-              dc.addEventListener('bufferedamountlow', () => {
-                clearTimeout(timer);
-                done();
-              }, { once: true });
-            });
+          if (dc.bufferedAmount > activeMaxBuffer) {
+            await this.waitForDataChannelBuffer(dc, activeMaxBuffer);
+          }
+
+          if (dc.readyState !== 'open') {
+            throw new Error(`DataChannel closed unexpectedly (state: ${dc.readyState})`);
           }
 
           dc.send(packet.buffer);
@@ -796,7 +840,12 @@ export class WebRTCManager {
         this.notifyTransferProgress(task, false);
       }
 
-      // Complete transfer immediately without freezing CPU on 1.5GB SHA-256 calculation
+      // Flush remaining data in transit before completing
+      if (dc.bufferedAmount > 0 && dc.readyState === 'open') {
+        await this.waitForDataChannelBuffer(dc, 0);
+      }
+
+      // Complete transfer notification
       this.sendControlMessage(targetPeerId, 'FILE_COMPLETE', task.id, {
         totalChunks,
         fileSize: file.size,
@@ -812,6 +861,13 @@ export class WebRTCManager {
       sendTransferNotification('File Sent Successfully', {
         body: `${task.fileName} (${formatBytes(task.fileSize)}) delivered to ${task.peerName}`,
       });
+    } catch (err: any) {
+      console.error('[AetherDrop] Stream file chunks error:', err);
+      task.status = 'error';
+      task.errorReason = err?.message || 'Transfer interrupted';
+      this.notifyTransferProgress(task, true);
+      playErrorTone();
+      throw err;
     } finally {
       this.resumeBackgroundHeartbeats();
     }
@@ -932,8 +988,19 @@ export class WebRTCManager {
           }
         } else if (msg.type === 'FILE_COMPLETE') {
           const task = this.activeTransfers.get(msg.transferId);
-          if (task && task.receivedChunks) {
-            this.finalizeReceivedFile(task);
+          if (task && task.receivedChunks && task.status !== 'completed') {
+            if (task.bytesTransferred < task.fileSize) {
+              let attempts = 0;
+              const checkInterval = setInterval(() => {
+                attempts++;
+                if (task.bytesTransferred >= task.fileSize || attempts >= 10) {
+                  clearInterval(checkInterval);
+                  this.finalizeReceivedFile(task);
+                }
+              }, 40);
+            } else {
+              this.finalizeReceivedFile(task);
+            }
           }
         }
       } catch (e) {
@@ -983,7 +1050,7 @@ export class WebRTCManager {
   }
 
   private finalizeReceivedFile(task: TransferTask) {
-    if (!task.receivedChunks) return;
+    if (!task.receivedChunks || task.status === 'completed') return;
 
     // Direct Blob instantiation without freezing CPU on redundant 1.5 GB SHA-256 calculation
     const blob = new Blob(task.receivedChunks as any, { type: task.mimeType });

@@ -143,7 +143,7 @@ export const ShareItHome: React.FC<ShareItHomeProps> = ({
                     ? 'bg-emerald-600 text-white animate-pulse'
                     : 'bg-neutral-100 dark:bg-neutral-800 text-neutral-600 dark:text-neutral-400'
                 }`}>
-                  {isTetherMode ? '1-Hop Boost Active (16 MB Socket)' : 'Standard LAN'}
+                  {isTetherMode ? '1-Hop Boost Active (Direct Host Routing)' : 'Standard LAN'}
                 </span>
               </div>
               <p className="text-[11px] text-neutral-500 dark:text-neutral-400 mt-0.5 leading-snug">
