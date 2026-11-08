@@ -49,6 +49,8 @@ interface RelayTransfer {
   transferId: string;
   senderId: string;
   targetId: string;
+  targetPin?: string;
+  roomId?: string;
   fileName: string;
   fileSize: number;
   totalChunks: number;
@@ -400,6 +402,8 @@ app.post('/api/relay/init', (req, res) => {
     transferId,
     senderId,
     targetId: targetId || '',
+    targetPin: targetPin || '',
+    roomId: roomId || 'default-lan',
     fileName: fileName || 'file',
     fileSize: fileSize || 0,
     totalChunks: totalChunks || 1,
@@ -459,6 +463,49 @@ app.post('/api/relay/init', (req, res) => {
   res.json({ ok: true, transferId });
 });
 
+// Endpoint for receivers to check if any active transfer is intended for them or their room
+app.get('/api/relay/active-for-peer', (req, res) => {
+  const peerId = (req.query.peerId as string) || '';
+  const pin = (req.query.pin as string) || '';
+  const roomId = (req.query.roomId as string) || 'default-lan';
+
+  const activeOffers: any[] = [];
+  const now = Date.now();
+
+  for (const [transferId, relay] of relayTransfers.entries()) {
+    if (relay.completed) continue;
+    if (now - relay.lastActive > 60000) continue;
+
+    // Check if this transfer is addressed to this peer
+    const matchesTargetId = Boolean(peerId && relay.targetId === peerId);
+    const matchesTargetPin = Boolean(pin && relay.targetPin === pin);
+    const matchesRoomBroadcast = (!relay.targetId || relay.targetId === 'room') && relay.roomId === roomId;
+    const matchesRoom = relay.roomId === roomId;
+
+    if (relay.senderId !== peerId && (matchesTargetId || matchesTargetPin || matchesRoomBroadcast || matchesRoom)) {
+      const senderPeer = peers.get(relay.senderId);
+      activeOffers.push({
+        type: 'FILE_OFFER',
+        transferId: relay.transferId,
+        senderId: relay.senderId,
+        senderName: senderPeer ? senderPeer.name : 'Nearby Sender',
+        senderPin: senderPeer ? senderPeer.pin : '',
+        fileName: relay.fileName,
+        fileSize: relay.fileSize,
+        totalChunks: relay.totalChunks,
+        mimeType: relay.mimeType,
+        encryptionMode: relay.encryptionMode,
+        isTetherMode: relay.isTetherMode,
+        fingerprint: relay.fingerprint,
+        rawKey: relay.rawKey,
+        startedAt: relay.lastActive,
+      });
+    }
+  }
+
+  res.json({ offers: activeOffers });
+});
+
 app.post(
   '/api/relay/chunk',
   express.raw({ type: '*/*', limit: '50mb' }),
@@ -481,19 +528,34 @@ app.post(
     relay.chunks.set(chunkIdx, bodyBuf);
     relay.lastActive = Date.now();
 
-    // Instant WebSocket push to receiver if connected: zero-polling latency
-    if (relay.targetId) {
-      const targetWs = peerSockets.get(relay.targetId);
-      if (targetWs && targetWs.readyState === WebSocket.OPEN) {
-        try {
-          targetWs.send(JSON.stringify({
-            type: 'WS_INCOMING_CHUNK',
-            transferId,
-            chunkIdx,
-            data: bodyBuf.toString('base64'),
-          }));
-        } catch {}
+    // Instant WebSocket push to receiver if connected: resolve target socket by ID, PIN, or room
+    let targetWs = relay.targetId ? peerSockets.get(relay.targetId) : undefined;
+    if (!targetWs && relay.targetPin) {
+      for (const [id, peer] of peers.entries()) {
+        if (peer.pin === relay.targetPin && id !== relay.senderId) {
+          targetWs = peerSockets.get(id);
+          if (targetWs) break;
+        }
       }
+    }
+    if (!targetWs && relay.roomId) {
+      for (const [id, peer] of peers.entries()) {
+        if (peer.roomId === relay.roomId && id !== relay.senderId) {
+          targetWs = peerSockets.get(id);
+          if (targetWs) break;
+        }
+      }
+    }
+
+    if (targetWs && targetWs.readyState === WebSocket.OPEN) {
+      try {
+        targetWs.send(JSON.stringify({
+          type: 'WS_INCOMING_CHUNK',
+          transferId,
+          chunkIdx,
+          data: bodyBuf.toString('base64'),
+        }));
+      } catch {}
     }
 
     res.json({ ok: true, chunkIdx });

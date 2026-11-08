@@ -74,6 +74,8 @@ export class WebRTCManager {
   private httpPollInterval: any = null;
   private httpPeersPollInterval: any = null;
   private httpHeartbeatInterval: any = null;
+  private httpRelayPollInterval: any = null;
+  private wsHeartbeatInterval: any = null;
   private seenPacketIds = new Set<string>();
 
   // WebRTC PeerConnections & Multi-Channel Striped DataChannels
@@ -162,6 +164,8 @@ export class WebRTCManager {
     if (this.httpPollInterval) clearInterval(this.httpPollInterval);
     if (this.httpPeersPollInterval) clearInterval(this.httpPeersPollInterval);
     if (this.httpHeartbeatInterval) clearInterval(this.httpHeartbeatInterval);
+    if (this.httpRelayPollInterval) clearInterval(this.httpRelayPollInterval);
+    if (this.wsHeartbeatInterval) clearInterval(this.wsHeartbeatInterval);
     if (this.wsReconnectTimer) clearTimeout(this.wsReconnectTimer);
 
     if (this.wsClient) {
@@ -281,6 +285,18 @@ export class WebRTCManager {
           avatarColor: this.selfPeer.avatarColor,
           roomId: this.roomId,
         }));
+
+        if (this.wsHeartbeatInterval) clearInterval(this.wsHeartbeatInterval);
+        this.wsHeartbeatInterval = setInterval(() => {
+          if (this.wsConnected && this.wsClient && this.wsClient.readyState === WebSocket.OPEN) {
+            try {
+              this.wsClient.send(JSON.stringify({
+                type: 'WS_HEARTBEAT',
+                id: this.selfPeer.id,
+              }));
+            } catch {}
+          }
+        }, 5000);
       };
 
       this.wsClient.onmessage = async (event) => {
@@ -331,6 +347,10 @@ export class WebRTCManager {
 
       this.wsClient.onclose = () => {
         this.wsConnected = false;
+        if (this.wsHeartbeatInterval) {
+          clearInterval(this.wsHeartbeatInterval);
+          this.wsHeartbeatInterval = null;
+        }
         if (!this.wsReconnectTimer) {
           this.wsReconnectTimer = setTimeout(() => {
             this.wsReconnectTimer = null;
@@ -341,6 +361,10 @@ export class WebRTCManager {
 
       this.wsClient.onerror = () => {
         this.wsConnected = false;
+        if (this.wsHeartbeatInterval) {
+          clearInterval(this.wsHeartbeatInterval);
+          this.wsHeartbeatInterval = null;
+        }
       };
     } catch (e) {
       console.warn('WebSocket init error:', e);
@@ -461,6 +485,25 @@ export class WebRTCManager {
         body: JSON.stringify({ id: this.selfPeer.id }),
       }).catch(() => {});
     }, 5000);
+
+    // Active Relay Transfer Poller: Guarantees receiver discovers incoming transfer even if signaling was missed
+    this.httpRelayPollInterval = setInterval(async () => {
+      try {
+        const res = await fetch(
+          `/api/relay/active-for-peer?peerId=${encodeURIComponent(this.selfPeer.id)}&pin=${encodeURIComponent(this.selfPeer.pin)}&roomId=${encodeURIComponent(this.roomId)}`
+        );
+        if (!res.ok) return;
+        const data = await res.json();
+        if (data && Array.isArray(data.offers)) {
+          for (const offer of data.offers) {
+            if (offer && offer.transferId && !this.activeTransfers.has(offer.transferId)) {
+              console.log('[AetherDrop] Discovered active incoming transfer on relay:', offer.transferId);
+              await this.handleFileOfferMessage(offer.senderId || 'relay', offer);
+            }
+          }
+        }
+      } catch {}
+    }, 1200);
   }
 
   private initMqttSignaling() {
@@ -1720,7 +1763,23 @@ export class WebRTCManager {
     });
   }
 
-  private async handleFileOfferMessage(peerId: string, offer: any) {
+  private extractOfferPayload(raw: any): any {
+    if (!raw) return null;
+    if (raw.transferId && (raw.fileName || raw.fileSize !== undefined)) return raw;
+    if (raw.payload && (raw.payload.transferId || raw.payload.fileName)) {
+      return this.extractOfferPayload(raw.payload);
+    }
+    if (raw.offer && (raw.offer.transferId || raw.offer.fileName)) {
+      return this.extractOfferPayload(raw.offer);
+    }
+    if (raw.data && (raw.data.transferId || raw.data.fileName)) {
+      return this.extractOfferPayload(raw.data);
+    }
+    return raw;
+  }
+
+  private async handleFileOfferMessage(peerId: string, rawOffer: any) {
+    const offer = this.extractOfferPayload(rawOffer);
     if (!offer || !offer.transferId) return;
     if (this.activeTransfers.has(offer.transferId)) return;
 
@@ -1733,15 +1792,16 @@ export class WebRTCManager {
         chunkKey = await importKeyRaw(rawKeyBuffer);
       }
       const peer = this.peers.get(peerId);
+      const senderDisplayName = peer?.name || offer.senderName || offer.sender?.name || 'Nearby Sender';
 
       const task: TransferTask = {
         id: offer.transferId,
-        fileName: offer.fileName,
-        fileSize: offer.fileSize,
-        mimeType: offer.mimeType,
+        fileName: offer.fileName || 'incoming_file',
+        fileSize: offer.fileSize || 0,
+        mimeType: offer.mimeType || 'application/octet-stream',
         direction: 'receive',
-        peerId,
-        peerName: peer ? peer.name : 'Nearby Peer',
+        peerId: peer?.id || peerId,
+        peerName: senderDisplayName,
         bytesTransferred: 0,
         progress: 0,
         speed: 0,
@@ -1754,8 +1814,8 @@ export class WebRTCManager {
         isTetherMode: offer.isTetherMode ?? this.isTetherMode,
         fingerprint: offer.fingerprint || 'DTLS-AES256',
         chunkKey,
-        totalChunks: offer.totalChunks,
-        receivedChunks: new Array(offer.totalChunks),
+        totalChunks: offer.totalChunks || 1,
+        receivedChunks: new Array(offer.totalChunks || 1),
       };
 
       if (offer.isTetherMode) {

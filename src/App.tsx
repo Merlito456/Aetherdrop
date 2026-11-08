@@ -174,8 +174,17 @@ export default function App() {
         });
       },
       onIncomingOffer: (incomingTask) => {
-        // Automatically switch receiver into the active SHAREit transfer session!
+        // Automatically register in transfers list and switch receiver into active session!
         setIncomingAlert(incomingTask);
+        setTransfers((prev) => {
+          const index = prev.findIndex((t) => t.id === incomingTask.id);
+          if (index === -1) {
+            return [incomingTask, ...prev];
+          }
+          const copy = [...prev];
+          copy[index] = { ...incomingTask };
+          return copy;
+        });
         setCurrentView('session');
       },
       onTransferCompleted: () => {},
