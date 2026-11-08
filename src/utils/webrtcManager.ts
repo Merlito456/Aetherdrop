@@ -13,8 +13,11 @@ import { sendTransferNotification } from './notifications';
 import { formatBytes } from './formatters';
 import mqtt, { MqttClient } from 'mqtt';
 
-const CHUNK_SIZE = 64 * 1024; // 64 KB per chunk (standard safe WebRTC MTU)
-const MAX_BUFFERED_AMOUNT = 1024 * 1024; // 1 MB backpressure ceiling
+// Tuned for Maximum Local Wi-Fi Throughput
+const CHUNK_SIZE = 128 * 1024; // 128 KB per chunk (optimal SCTP frame size)
+const BLOCK_READ_SIZE = 2 * 1024 * 1024; // 2 MB bulk disk/memory slice buffer
+const MAX_BUFFERED_AMOUNT = 2 * 1024 * 1024; // 2 MB pipeline window ceiling
+const BUFFER_LOW_THRESHOLD = 512 * 1024; // 512 KB resume threshold
 
 export interface WebRTCManagerCallbacks {
   onPeersUpdated: (peers: Peer[]) => void;
@@ -46,6 +49,7 @@ export class WebRTCManager {
   private pausedTransfers = new Set<string>();
   private cancelledTransfers = new Set<string>();
   private speedTrackers = new Map<string, { lastBytes: number; lastTime: number }>();
+  private lastUiUpdateTimes = new Map<string, number>();
   private simulatedPeerActive: boolean = false;
   private presenceInterval: any = null;
   private pruneInterval: any = null;
@@ -297,7 +301,6 @@ export class WebRTCManager {
     });
   }
 
-  // Ensure DataChannel is completely open before sending any chunks
   private ensureDataChannelConnected(targetPeerId: string): Promise<RTCDataChannel> {
     const existing = this.dataChannels.get(targetPeerId);
     if (existing && existing.readyState === 'open') {
@@ -404,7 +407,7 @@ export class WebRTCManager {
 
   private setupDataChannel(peerId: string, dc: RTCDataChannel) {
     dc.binaryType = 'arraybuffer';
-    dc.bufferedAmountLowThreshold = 256 * 1024; // 256 KB
+    dc.bufferedAmountLowThreshold = BUFFER_LOW_THRESHOLD;
 
     dc.onopen = () => {
       console.log(`[AetherDrop] Direct WebRTC DataChannel OPEN with peer ${peerId}`);
@@ -415,7 +418,6 @@ export class WebRTCManager {
       }
       this.broadcastPeersList();
 
-      // Resolve any pending connection promises
       const waiters = this.dataChannelWaiters.get(peerId);
       if (waiters) {
         for (const resolve of waiters) {
@@ -466,6 +468,17 @@ export class WebRTCManager {
     this.broadcastPeersList();
   }
 
+  // Throttled UI notifications to keep main thread free for maximum wire throughput
+  private notifyTransferProgress(task: TransferTask, force: boolean = false) {
+    const now = Date.now();
+    const last = this.lastUiUpdateTimes.get(task.id) || 0;
+    if (force || now - last >= 60) {
+      this.lastUiUpdateTimes.set(task.id, now);
+      this.updateMetrics(task);
+      this.callbacks.onTransferUpdated({ ...task });
+    }
+  }
+
   // High-Speed Encrypted File Send
   public async sendFile(file: File, targetPeer: Peer): Promise<string> {
     const transferId = 'xfer_' + Math.random().toString(36).slice(2, 10);
@@ -498,7 +511,7 @@ export class WebRTCManager {
 
     this.activeTransfers.set(transferId, task);
     this.speedTrackers.set(transferId, { lastBytes: 0, lastTime: Date.now() });
-    this.callbacks.onTransferUpdated(task);
+    this.notifyTransferProgress(task, true);
     playStartTone();
 
     if (targetPeer.id === 'simulated_peer_test') {
@@ -507,10 +520,8 @@ export class WebRTCManager {
     }
 
     try {
-      // 1. Ensure DataChannel is connected before streaming
       const dc = await this.ensureDataChannelConnected(targetPeer.id);
 
-      // 2. Prepare metadata offer
       const offer = {
         type: 'FILE_OFFER',
         transferId,
@@ -522,9 +533,8 @@ export class WebRTCManager {
         fingerprint,
       };
 
-      // 3. Await receiver confirmation with timeout
       const acceptPromise = new Promise<boolean>((resolve) => {
-        const timer = setTimeout(() => resolve(true), 2500); // Proceed anyway after 2.5s
+        const timer = setTimeout(() => resolve(true), 2500);
         this.fileAcceptWaiters.set(transferId, (acc) => {
           clearTimeout(timer);
           resolve(acc);
@@ -533,7 +543,6 @@ export class WebRTCManager {
 
       dc.send(JSON.stringify(offer));
 
-      // Also send over signaling as backup
       this.sendSignalingMessage({ peerId: targetPeer.id }, {
         type: 'FILE_OFFER_SIGNAL',
         payload: offer,
@@ -541,20 +550,19 @@ export class WebRTCManager {
 
       await acceptPromise;
 
-      // 4. Stream binary chunks directly over DataChannel
       this.streamFileChunks(task, file, key, targetPeer.id, dc);
     } catch (err: any) {
       console.error('Send file failed:', err);
       task.status = 'error';
       task.errorReason = err?.message || 'Failed to establish peer connection';
-      this.callbacks.onTransferUpdated(task);
+      this.notifyTransferProgress(task, true);
       playErrorTone();
     }
 
     return transferId;
   }
 
-  // High-Speed Binary Streaming (No JSON stringification overhead per chunk)
+  // Maximum Local Wi-Fi Throughput Binary Streaming Engine
   private async streamFileChunks(
     task: TransferTask,
     file: File,
@@ -564,15 +572,18 @@ export class WebRTCManager {
   ) {
     task.status = 'transferring';
     task.updatedAt = Date.now();
-    this.callbacks.onTransferUpdated(task);
+    this.notifyTransferProgress(task, true);
 
     const totalChunks = Math.ceil(file.size / CHUNK_SIZE);
     let bytesSent = 0;
 
+    let blockStart = 0;
+    let blockBuffer: ArrayBuffer | null = null;
+
     for (let chunkIdx = 0; chunkIdx < totalChunks; chunkIdx++) {
       if (this.cancelledTransfers.has(task.id)) {
         task.status = 'cancelled';
-        this.callbacks.onTransferUpdated(task);
+        this.notifyTransferProgress(task, true);
         this.sendControlMessage(targetPeerId, 'CANCEL', task.id);
         return;
       }
@@ -580,8 +591,8 @@ export class WebRTCManager {
       while (this.pausedTransfers.has(task.id)) {
         task.status = 'paused';
         task.speed = 0;
-        this.callbacks.onTransferUpdated(task);
-        await new Promise((r) => setTimeout(r, 300));
+        this.notifyTransferProgress(task, true);
+        await new Promise((r) => setTimeout(r, 200));
         if (this.cancelledTransfers.has(task.id)) return;
       }
 
@@ -589,23 +600,31 @@ export class WebRTCManager {
         task.status = 'transferring';
       }
 
-      const start = chunkIdx * CHUNK_SIZE;
-      const end = Math.min(start + CHUNK_SIZE, file.size);
-      const slice = file.slice(start, end);
-      const buffer = await slice.arrayBuffer();
+      const chunkStart = chunkIdx * CHUNK_SIZE;
+      const chunkEnd = Math.min(chunkStart + CHUNK_SIZE, file.size);
+      const chunkSize = chunkEnd - chunkStart;
+
+      // Bulk memory prefetch (2 MB block slices) to eliminate disk contention
+      if (!blockBuffer || chunkStart >= blockStart + BLOCK_READ_SIZE) {
+        blockStart = chunkStart;
+        const blockEnd = Math.min(blockStart + BLOCK_READ_SIZE, file.size);
+        blockBuffer = await file.slice(blockStart, blockEnd).arrayBuffer();
+      }
+
+      const offsetInBlock = chunkStart - blockStart;
+      const rawChunk = blockBuffer.slice(offsetInBlock, offsetInBlock + chunkSize);
 
       // Encrypt chunk using AES-256-GCM
-      const { encrypted, iv } = await encryptChunk(key, buffer, chunkIdx);
+      const { encrypted, iv } = await encryptChunk(key, rawChunk, chunkIdx);
 
-      // Pure Binary Packet Layout:
-      // [4 bytes chunkIndex (Uint32)] [12 bytes IV] [Encrypted Bytes]
+      // Binary Packet: [4 bytes chunkIdx (Uint32)] [12 bytes IV] [Encrypted Payload]
       const packet = new Uint8Array(16 + encrypted.byteLength);
       const view = new DataView(packet.buffer);
       view.setUint32(0, chunkIdx, false);
       packet.set(iv, 4);
       packet.set(new Uint8Array(encrypted), 16);
 
-      // High-performance backpressure flow control
+      // SCTP Pipeline Backpressure
       if (dc.bufferedAmount > MAX_BUFFERED_AMOUNT) {
         await new Promise<void>((resolve) => {
           const onLow = () => {
@@ -618,12 +637,11 @@ export class WebRTCManager {
 
       dc.send(packet.buffer);
 
-      bytesSent += (end - start);
+      bytesSent += chunkSize;
       task.bytesTransferred = bytesSent;
       task.progress = Math.min(100, Math.round((bytesSent / file.size) * 100));
 
-      this.updateMetrics(task);
-      this.callbacks.onTransferUpdated(task);
+      this.notifyTransferProgress(task, false);
     }
 
     const fullBuffer = await file.arrayBuffer();
@@ -636,7 +654,7 @@ export class WebRTCManager {
     task.completedAt = Date.now();
     task.speed = 0;
     task.eta = 0;
-    this.callbacks.onTransferUpdated(task);
+    this.notifyTransferProgress(task, true);
     this.callbacks.onTransferCompleted(task);
     playSuccessChime();
     sendTransferNotification('File Sent Successfully', {
@@ -650,7 +668,6 @@ export class WebRTCManager {
     if (dc && dc.readyState === 'open') {
       dc.send(payload);
     }
-    // Also send over signaling as safety net
     this.sendSignalingMessage({ peerId: targetPeerId }, {
       type: 'CONTROL_SIGNAL',
       payload,
@@ -659,7 +676,7 @@ export class WebRTCManager {
 
   private async handleFileOfferMessage(peerId: string, offer: any) {
     if (!offer || !offer.transferId) return;
-    if (this.activeTransfers.has(offer.transferId)) return; // Prevent duplicate registration
+    if (this.activeTransfers.has(offer.transferId)) return;
 
     try {
       const rawKeyBuffer = new Uint8Array(offer.rawKey).buffer;
@@ -691,16 +708,14 @@ export class WebRTCManager {
       this.activeTransfers.set(task.id, task);
       this.speedTrackers.set(task.id, { lastBytes: 0, lastTime: Date.now() });
 
-      // Notify UI immediately!
       this.callbacks.onIncomingOffer(task);
-      this.callbacks.onTransferUpdated(task);
+      this.notifyTransferProgress(task, true);
       playStartTone();
 
       sendTransferNotification('Incoming File Transfer', {
         body: `Receiving ${task.fileName} (${formatBytes(task.fileSize)}) from ${task.peerName}...`,
       });
 
-      // Send acceptance confirmation back
       const dc = this.dataChannels.get(peerId);
       const acceptMsg = JSON.stringify({ type: 'FILE_ACCEPT', transferId: task.id });
       if (dc && dc.readyState === 'open') {
@@ -732,21 +747,21 @@ export class WebRTCManager {
           const task = this.activeTransfers.get(msg.transferId);
           if (task) {
             task.status = 'paused';
-            this.callbacks.onTransferUpdated(task);
+            this.notifyTransferProgress(task, true);
           }
         } else if (msg.type === 'RESUME') {
           this.pausedTransfers.delete(msg.transferId);
           const task = this.activeTransfers.get(msg.transferId);
           if (task) {
             task.status = 'transferring';
-            this.callbacks.onTransferUpdated(task);
+            this.notifyTransferProgress(task, true);
           }
         } else if (msg.type === 'CANCEL') {
           this.cancelledTransfers.add(msg.transferId);
           const task = this.activeTransfers.get(msg.transferId);
           if (task) {
             task.status = 'cancelled';
-            this.callbacks.onTransferUpdated(task);
+            this.notifyTransferProgress(task, true);
             playErrorTone();
           }
         } else if (msg.type === 'FILE_COMPLETE') {
@@ -759,8 +774,6 @@ export class WebRTCManager {
         console.warn('DataChannel message parse error:', e);
       }
     } else if (data instanceof ArrayBuffer) {
-      // Pure Binary Chunk Packet Layout:
-      // [4 bytes chunkIndex (UInt32)] [12 bytes IV] [Ciphertext bytes]
       if (data.byteLength < 16) return;
 
       const view = new DataView(data);
@@ -768,23 +781,21 @@ export class WebRTCManager {
       const iv = new Uint8Array(data, 4, 12);
       const ciphertext = data.slice(16);
 
-      // Find the receiving task for this peer
       for (const task of this.activeTransfers.values()) {
         if (task.peerId === peerId && task.direction === 'receive' && task.status === 'transferring' && task.chunkKey) {
           try {
             const decrypted = await decryptChunk(task.chunkKey, ciphertext, iv);
-            if (!task.receivedChunks) task.receivedChunks = [];
+            if (!task.receivedChunks) task.receivedChunks = new Array(task.totalChunks || 1);
             task.receivedChunks[chunkIdx] = decrypted;
             task.bytesTransferred += decrypted.byteLength;
             task.progress = Math.min(100, Math.round((task.bytesTransferred / task.fileSize) * 100));
 
-            this.updateMetrics(task);
-            this.callbacks.onTransferUpdated(task);
+            this.notifyTransferProgress(task, false);
           } catch (err) {
             console.error('Decryption failed for chunk:', err);
             task.status = 'error';
             task.errorReason = 'Cryptographic verification failed';
-            this.callbacks.onTransferUpdated(task);
+            this.notifyTransferProgress(task, true);
           }
           break;
         }
@@ -804,7 +815,7 @@ export class WebRTCManager {
     if (expectedChecksum && expectedChecksum !== actualChecksum) {
       task.status = 'error';
       task.errorReason = 'Integrity checksum mismatch. Data was corrupted.';
-      this.callbacks.onTransferUpdated(task);
+      this.notifyTransferProgress(task, true);
       playErrorTone();
       return;
     }
@@ -824,7 +835,7 @@ export class WebRTCManager {
     a.click();
     document.body.removeChild(a);
 
-    this.callbacks.onTransferUpdated(task);
+    this.notifyTransferProgress(task, true);
     this.callbacks.onTransferCompleted(task);
     playSuccessChime();
     sendTransferNotification('File Received', {
@@ -841,10 +852,10 @@ export class WebRTCManager {
     }
 
     const elapsed = (now - tracker.lastTime) / 1000;
-    if (elapsed >= 0.3) {
+    if (elapsed >= 0.25) {
       const bytesDiff = task.bytesTransferred - tracker.lastBytes;
       const currentSpeed = bytesDiff / elapsed;
-      task.speed = task.speed === 0 ? currentSpeed : Math.round(task.speed * 0.4 + currentSpeed * 0.6);
+      task.speed = task.speed === 0 ? currentSpeed : Math.round(task.speed * 0.35 + currentSpeed * 0.65);
 
       const remainingBytes = Math.max(0, task.fileSize - task.bytesTransferred);
       task.eta = task.speed > 0 ? remainingBytes / task.speed : 0;
@@ -861,7 +872,7 @@ export class WebRTCManager {
     if (task) {
       task.status = 'paused';
       task.speed = 0;
-      this.callbacks.onTransferUpdated(task);
+      this.notifyTransferProgress(task, true);
       this.sendControlMessage(task.peerId, 'PAUSE', transferId);
     }
   }
@@ -871,7 +882,7 @@ export class WebRTCManager {
     const task = this.activeTransfers.get(transferId);
     if (task) {
       task.status = 'transferring';
-      this.callbacks.onTransferUpdated(task);
+      this.notifyTransferProgress(task, true);
       this.sendControlMessage(task.peerId, 'RESUME', transferId);
     }
   }
@@ -888,7 +899,7 @@ export class WebRTCManager {
         URL.revokeObjectURL(task.downloadUrl);
         delete task.downloadUrl;
       }
-      this.callbacks.onTransferUpdated(task);
+      this.notifyTransferProgress(task, true);
       this.sendControlMessage(task.peerId, 'CANCEL', transferId);
       playErrorTone();
     }
@@ -903,7 +914,7 @@ export class WebRTCManager {
   ) {
     task.status = 'transferring';
     task.updatedAt = Date.now();
-    this.callbacks.onTransferUpdated(task);
+    this.notifyTransferProgress(task, true);
 
     const totalChunks = Math.ceil(file.size / CHUNK_SIZE);
     let bytesSent = 0;
@@ -912,15 +923,15 @@ export class WebRTCManager {
     for (let i = 0; i < totalChunks; i++) {
       if (this.cancelledTransfers.has(task.id)) {
         task.status = 'cancelled';
-        this.callbacks.onTransferUpdated(task);
+        this.notifyTransferProgress(task, true);
         return;
       }
 
       while (this.pausedTransfers.has(task.id)) {
         task.status = 'paused';
         task.speed = 0;
-        this.callbacks.onTransferUpdated(task);
-        await new Promise((r) => setTimeout(r, 300));
+        this.notifyTransferProgress(task, true);
+        await new Promise((r) => setTimeout(r, 200));
         if (this.cancelledTransfers.has(task.id)) return;
       }
 
@@ -941,12 +952,11 @@ export class WebRTCManager {
       task.bytesTransferred = bytesSent;
       task.progress = Math.min(100, Math.round((bytesSent / file.size) * 100));
 
-      this.updateMetrics(task);
-      this.callbacks.onTransferUpdated(task);
+      this.notifyTransferProgress(task, false);
 
-      // Smooth simulated pacing
-      if (i % 2 === 0) {
-        await new Promise((r) => setTimeout(r, 2));
+      // Fast simulated pacing (high-speed Wi-Fi representation)
+      if (i % 3 === 0) {
+        await new Promise((r) => setTimeout(r, 1));
       }
     }
 
@@ -961,7 +971,7 @@ export class WebRTCManager {
     task.speed = 0;
     task.eta = 0;
 
-    this.callbacks.onTransferUpdated(task);
+    this.notifyTransferProgress(task, true);
     this.callbacks.onTransferCompleted(task);
     playSuccessChime();
     sendTransferNotification('Local Wi-Fi Transfer Complete', {

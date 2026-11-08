@@ -8,14 +8,27 @@ import {
 } from './utils/notifications';
 import { formatBytes } from './utils/formatters';
 import { TopBar } from './components/TopBar';
-import { Dropzone } from './components/Dropzone';
+import { ShareItHome } from './components/ShareItHome';
+import { ShareItFileSelector } from './components/ShareItFileSelector';
+import { ShareItRadarScanner } from './components/ShareItRadarScanner';
+import { ShareItReceiveMode } from './components/ShareItReceiveMode';
+import { ShareItSessionView } from './components/ShareItSessionView';
 import { TransferList } from './components/TransferList';
 import { NearbyRadar } from './components/NearbyRadar';
 import { QRCodeModal } from './components/QRCodeModal';
 import { QRScannerModal } from './components/QRScannerModal';
 import { SecurityModal } from './components/SecurityModal';
 import { RoomModal } from './components/RoomModal';
-import { Lock, Wifi, Zap, ShieldCheck, Radio, ArrowDownLeft, X } from 'lucide-react';
+import { Lock, ArrowDownLeft, X } from 'lucide-react';
+
+type ShareItView =
+  | 'home'
+  | 'send-select'
+  | 'send-radar'
+  | 'receive-beacon'
+  | 'session'
+  | 'radar-all'
+  | 'transfers-history';
 
 export default function App() {
   // Theme state
@@ -56,8 +69,11 @@ export default function App() {
     return 'default-lan';
   });
 
-  // UI Navigation & Modals
-  const [currentTab, setCurrentTab] = useState<'transfers' | 'radar' | 'security' | 'rooms'>('radar');
+  // Navigation state (SHAREit flow)
+  const [currentView, setCurrentView] = useState<ShareItView>('home');
+  const [stagedFilesToSend, setStagedFilesToSend] = useState<File[]>([]);
+
+  // Modals state
   const [isQRModalOpen, setIsQRModalOpen] = useState(false);
   const [isScannerModalOpen, setIsScannerModalOpen] = useState(false);
   const [isSecurityModalOpen, setIsSecurityModalOpen] = useState(false);
@@ -76,10 +92,6 @@ export default function App() {
   const [selectedPeerId, setSelectedPeerId] = useState<string | null>(null);
   const [transfers, setTransfers] = useState<TransferTask[]>([]);
   const [simulatedPeerActive, setSimulatedPeerActive] = useState<boolean>(false);
-
-  // Hidden file input for direct-to-peer transmission
-  const directPeerRef = useRef<Peer | null>(null);
-  const directFileInputRef = useRef<HTMLInputElement>(null);
 
   // Manager reference
   const managerRef = useRef<WebRTCManager | null>(null);
@@ -109,11 +121,11 @@ export default function App() {
           return copy;
         });
 
-        // Update live incoming alert banner if it matches
+        // Update live incoming alert toast
         setIncomingAlert((current) => {
           if (current && current.id === updatedTask.id) {
             if (updatedTask.status === 'completed' || updatedTask.status === 'error' || updatedTask.status === 'cancelled') {
-              setTimeout(() => setIncomingAlert(null), 3000);
+              setTimeout(() => setIncomingAlert(null), 3500);
             }
             return updatedTask;
           }
@@ -121,12 +133,11 @@ export default function App() {
         });
       },
       onIncomingOffer: (incomingTask) => {
-        // 1. Immediately notify receiving device in real-time!
+        // Automatically switch receiver into the active SHAREit transfer session!
         setIncomingAlert(incomingTask);
-        // 2. Automatically switch receiver to Transfers view so they see live progress bar!
-        setCurrentTab('transfers');
+        setCurrentView('session');
       },
-      onTransferCompleted: (_task) => {},
+      onTransferCompleted: () => {},
       onSignalingStatus: (status, msg) => {
         setSignalingStatus(status);
         if (msg) setSignalingMessage(msg);
@@ -136,7 +147,7 @@ export default function App() {
     managerRef.current = manager;
     manager.init();
 
-    // Check if URL has ?pin=... for automatic pairing
+    // Auto-pair if URL has ?pin=...
     if (typeof window !== 'undefined') {
       const params = new URLSearchParams(window.location.search);
       const targetPin = params.get('pin');
@@ -152,13 +163,11 @@ export default function App() {
     };
   }, [selfPeer, roomId]);
 
-  // Request notifications
   const handleRequestNotification = async () => {
     const granted = await requestNotificationPermission();
     setNotificationStatus(granted ? 'granted' : 'denied');
   };
 
-  // Switch Room
   const handleSwitchRoom = (newRoom: string) => {
     setRoomId(newRoom);
     managerRef.current?.setRoomId(newRoom);
@@ -166,26 +175,28 @@ export default function App() {
     window.history.replaceState(null, '', newUrl);
   };
 
-  // Send files
-  const handleSendFiles = async (files: File[], targetPeer: Peer) => {
-    if (!managerRef.current || files.length === 0) return;
-    for (const file of files) {
+  // SHAREit SEND Flow Handlers
+  const handleStartSend = () => {
+    setStagedFilesToSend([]);
+    setCurrentView('send-select');
+  };
+
+  const handleProceedToRadar = (files: File[]) => {
+    setStagedFilesToSend(files);
+    setCurrentView('send-radar');
+  };
+
+  const handleSelectReceiverAndSend = async (targetPeer: Peer) => {
+    if (!managerRef.current || stagedFilesToSend.length === 0) return;
+    setCurrentView('session');
+    for (const file of stagedFilesToSend) {
       await managerRef.current.sendFile(file, targetPeer);
     }
-    setCurrentTab('transfers');
   };
 
-  const handleDirectSendFiles = (peer: Peer) => {
-    directPeerRef.current = peer;
-    directFileInputRef.current?.click();
-  };
-
-  const handleDirectFileInputChange = (e: React.ChangeEvent<HTMLInputElement>) => {
-    if (e.target.files && e.target.files.length > 0 && directPeerRef.current) {
-      const files = Array.from(e.target.files);
-      handleSendFiles(files, directPeerRef.current);
-    }
-    e.target.value = '';
+  // SHAREit RECEIVE Flow Handlers
+  const handleStartReceive = () => {
+    setCurrentView('receive-beacon');
   };
 
   // Direct connect by PIN
@@ -249,27 +260,19 @@ export default function App() {
   };
 
   const activeTransfersCount = transfers.filter(
-    (t) => t.status === 'transferring' || t.status === 'encrypting'
+    (t) => t.status === 'transferring' || t.status === 'encrypting' || t.status === 'paused'
   ).length;
 
   return (
     <div className="min-h-screen bg-neutral-50 dark:bg-neutral-950 text-neutral-900 dark:text-neutral-100 flex flex-col font-sans transition-colors duration-200">
-      {/* Hidden file input for direct peer transfers */}
-      <input
-        ref={directFileInputRef}
-        type="file"
-        multiple
-        className="hidden"
-        onChange={handleDirectFileInputChange}
-      />
-
       {/* Top Bar */}
       <TopBar
-        currentTab={currentTab}
+        currentTab={currentView === 'transfers-history' ? 'transfers' : currentView === 'radar-all' ? 'radar' : 'transfers'}
         setCurrentTab={(tab) => {
-          if (tab === 'security') setIsSecurityModalOpen(true);
+          if (tab === 'transfers') setCurrentView(activeTransfersCount > 0 ? 'session' : 'transfers-history');
+          else if (tab === 'radar') setCurrentView('radar-all');
+          else if (tab === 'security') setIsSecurityModalOpen(true);
           else if (tab === 'rooms') setIsRoomModalOpen(true);
-          else setCurrentTab(tab);
         }}
         activeTransferCount={activeTransfersCount}
         darkMode={darkMode}
@@ -282,20 +285,23 @@ export default function App() {
         selfPeer={selfPeer}
       />
 
-      {/* Real-time Floating Incoming Transfer Toast / Alert Banner */}
-      {incomingAlert && (
-        <div className="fixed bottom-4 right-4 z-50 max-w-sm w-full bg-white dark:bg-neutral-900 border border-cyan-500/30 rounded-2xl p-4 shadow-xl shadow-cyan-500/10 animate-in slide-in-from-bottom-5 duration-200">
+      {/* Floating Incoming Toast */}
+      {incomingAlert && currentView !== 'session' && (
+        <div
+          onClick={() => setCurrentView('session')}
+          className="fixed bottom-4 right-4 z-50 max-w-sm w-full bg-white dark:bg-neutral-900 border border-emerald-500/40 rounded-2xl p-4 shadow-xl shadow-emerald-500/10 cursor-pointer animate-in slide-in-from-bottom-5 duration-200"
+        >
           <div className="flex items-start justify-between gap-3">
-            <div className="flex items-center gap-2.5">
-              <div className="w-9 h-9 rounded-xl bg-cyan-100 dark:bg-cyan-950/70 text-cyan-600 dark:text-cyan-400 flex items-center justify-center shrink-0">
+            <div className="flex items-center gap-2.5 min-w-0">
+              <div className="w-9 h-9 rounded-xl bg-emerald-100 dark:bg-emerald-950/70 text-emerald-600 dark:text-emerald-400 flex items-center justify-center shrink-0">
                 <ArrowDownLeft className="w-5 h-5 animate-bounce" />
               </div>
               <div className="min-w-0">
                 <div className="flex items-center gap-2">
-                  <span className="text-xs font-bold text-neutral-900 dark:text-neutral-100 truncate">
-                    {incomingAlert.status === 'completed' ? 'Transfer Completed' : 'Incoming File Transfer'}
+                  <span className="text-xs font-bold text-neutral-900 dark:text-neutral-100">
+                    {incomingAlert.status === 'completed' ? 'Transfer Complete' : 'Incoming Transfer'}
                   </span>
-                  <span className="text-[10px] font-mono text-cyan-600 dark:text-cyan-400 font-semibold">
+                  <span className="text-[10px] font-mono font-bold text-emerald-600">
                     {incomingAlert.progress}%
                   </span>
                 </div>
@@ -303,82 +309,93 @@ export default function App() {
                   {incomingAlert.fileName} ({formatBytes(incomingAlert.fileSize)})
                 </p>
                 <p className="text-[11px] text-neutral-400">
-                  From: {incomingAlert.peerName}
+                  Tap to view live transfer session
                 </p>
               </div>
             </div>
             <button
-              onClick={() => setIncomingAlert(null)}
+              onClick={(e) => {
+                e.stopPropagation();
+                setIncomingAlert(null);
+              }}
               className="text-neutral-400 hover:text-neutral-700 dark:hover:text-neutral-200 p-1"
             >
               <X className="w-4 h-4" />
             </button>
           </div>
-
-          {/* Mini progress bar */}
-          <div className="mt-3 w-full bg-neutral-200 dark:bg-neutral-800 h-1.5 rounded-full overflow-hidden">
-            <div
-              className="h-full bg-gradient-to-r from-cyan-500 to-blue-500 rounded-full transition-all duration-200"
-              style={{ width: `${incomingAlert.progress}%` }}
-            />
-          </div>
         </div>
       )}
 
-      {/* Main Content Viewport */}
-      <main className="flex-1 max-w-7xl w-full mx-auto px-4 sm:px-6 lg:px-8 py-6 sm:py-8 space-y-6">
+      {/* Main Viewport */}
+      <main className="flex-1 max-w-7xl w-full mx-auto px-4 sm:px-6 lg:px-8 py-6 sm:py-8">
         
-        {/* Network & Signaling Ribbon */}
-        <div className="p-3.5 bg-white dark:bg-neutral-900 rounded-xl border border-neutral-200 dark:border-neutral-800 flex flex-wrap items-center justify-between gap-3 text-xs shadow-2xs">
-          <div className="flex items-center gap-2 sm:gap-4 flex-wrap">
-            <span className="flex items-center gap-1.5 font-medium text-neutral-800 dark:text-neutral-200">
-              <Wifi className="w-3.5 h-3.5 text-cyan-500" />
-              <span>Room:</span>
-              <button
-                onClick={() => setIsRoomModalOpen(true)}
-                className="font-mono font-semibold text-cyan-600 dark:text-cyan-400 hover:underline"
-              >
-                {roomId}
-              </button>
-            </span>
-            <span className="hidden sm:inline text-neutral-300 dark:text-neutral-700">|</span>
-            <span className="flex items-center gap-1.5 text-neutral-600 dark:text-neutral-400">
-              <Zap className="w-3.5 h-3.5 text-amber-500" />
-              <span>{peers.length} {peers.length === 1 ? 'device' : 'devices'} in range</span>
-            </span>
-            <span className="hidden sm:inline text-neutral-300 dark:text-neutral-700">|</span>
-            <span
-              className={`flex items-center gap-1 font-medium ${
-                signalingStatus === 'connected'
-                  ? 'text-emerald-600 dark:text-emerald-400'
-                  : signalingStatus === 'connecting'
-                  ? 'text-amber-600 dark:text-amber-400'
-                  : 'text-neutral-500'
-              }`}
-            >
-              <Radio className="w-3.5 h-3.5" />
-              <span>{signalingMessage}</span>
-            </span>
-            <span className="hidden sm:inline text-neutral-300 dark:text-neutral-700">|</span>
-            <span className="flex items-center gap-1 text-emerald-600 dark:text-emerald-400 font-medium">
-              <ShieldCheck className="w-3.5 h-3.5" />
-              <span>AES-256-GCM Direct Channel</span>
-            </span>
-          </div>
+        {/* SHAREit Screen 1: Home (Big Send & Receive Buttons) */}
+        {currentView === 'home' && (
+          <ShareItHome
+            selfPeer={selfPeer}
+            roomId={roomId}
+            peersCount={peers.length}
+            activeTransfersCount={activeTransfersCount}
+            onStartSend={handleStartSend}
+            onStartReceive={handleStartReceive}
+            onOpenQR={() => setIsQRModalOpen(true)}
+            onOpenScanner={() => setIsScannerModalOpen(true)}
+            onOpenRooms={() => setIsRoomModalOpen(true)}
+            onViewTransfers={() => setCurrentView(activeTransfersCount > 0 ? 'session' : 'transfers-history')}
+            simulatedPeerEnabled={simulatedPeerActive}
+            onToggleSimulatedPeer={handleToggleSimulatedPeer}
+          />
+        )}
 
-          <div className="flex items-center gap-2 text-[11px] text-neutral-500 dark:text-neutral-400">
-            <button
-              onClick={() => setIsSecurityModalOpen(true)}
-              className="hover:text-neutral-900 dark:hover:text-neutral-100 transition-colors flex items-center gap-1"
-            >
-              <Lock className="w-3 h-3 text-emerald-500" />
-              <span>Zero-Storage Memory Verified</span>
-            </button>
-          </div>
-        </div>
+        {/* SHAREit Screen 2: Select Files to Send */}
+        {currentView === 'send-select' && (
+          <ShareItFileSelector
+            onBack={() => setCurrentView('home')}
+            onProceedToRadar={handleProceedToRadar}
+          />
+        )}
 
-        {/* View Switcher: Nearby Radar View vs Transfers View */}
-        {currentTab === 'radar' ? (
+        {/* SHAREit Screen 3: Sonar Radar Scanning for Receivers */}
+        {currentView === 'send-radar' && (
+          <ShareItRadarScanner
+            selfPeer={selfPeer}
+            stagedFiles={stagedFilesToSend}
+            peers={peers}
+            onBack={() => setCurrentView('send-select')}
+            onSelectReceiver={handleSelectReceiverAndSend}
+            onOpenScanner={() => setIsScannerModalOpen(true)}
+            onRefresh={() => managerRef.current?.fetchPeers()}
+            onConnectByPin={handleConnectByPin}
+            signalingStatus={signalingStatus}
+            signalingMessage={signalingMessage}
+          />
+        )}
+
+        {/* SHAREit Screen 4: Receive Mode (Beacon & Receiver QR) */}
+        {currentView === 'receive-beacon' && (
+          <ShareItReceiveMode
+            selfPeer={selfPeer}
+            roomId={roomId}
+            onBack={() => setCurrentView('home')}
+            signalingStatus={signalingStatus}
+          />
+        )}
+
+        {/* SHAREit Screen 5: Active Bilateral Transfer Session */}
+        {currentView === 'session' && (
+          <ShareItSessionView
+            selfPeer={selfPeer}
+            transfers={transfers}
+            onPause={handlePause}
+            onResume={handleResume}
+            onCancel={handleCancel}
+            onSendMore={handleStartSend}
+            onExitSession={() => setCurrentView('home')}
+          />
+        )}
+
+        {/* Fallback View: Classic Radar View */}
+        {currentView === 'radar-all' && (
           <div className="space-y-6">
             <NearbyRadar
               selfPeer={selfPeer}
@@ -386,36 +403,44 @@ export default function App() {
               selectedPeerId={selectedPeerId}
               onSelectPeer={(id) => {
                 setSelectedPeerId(id);
-                setCurrentTab('transfers');
+                setCurrentView('transfers-history');
               }}
               onOpenQR={() => setIsQRModalOpen(true)}
               onOpenScanner={() => setIsScannerModalOpen(true)}
               onRefresh={() => managerRef.current?.fetchPeers()}
               simulatedPeerEnabled={simulatedPeerActive}
               onToggleSimulatedPeer={handleToggleSimulatedPeer}
-              onDirectSendFiles={handleDirectSendFiles}
+              onDirectSendFiles={(peer) => {
+                setSelectedPeerId(peer.id);
+                handleStartSend();
+              }}
               onConnectByPin={handleConnectByPin}
               signalingStatus={signalingStatus}
               signalingMessage={signalingMessage}
             />
-
-            <Dropzone
-              availablePeers={peers}
-              selectedPeerId={selectedPeerId}
-              setSelectedPeerId={setSelectedPeerId}
-              onSendFiles={handleSendFiles}
-              onOpenRadar={() => setCurrentTab('radar')}
-            />
           </div>
-        ) : (
-          <div className="space-y-6">
-            <Dropzone
-              availablePeers={peers}
-              selectedPeerId={selectedPeerId}
-              setSelectedPeerId={setSelectedPeerId}
-              onSendFiles={handleSendFiles}
-              onOpenRadar={() => setCurrentTab('radar')}
-            />
+        )}
+
+        {/* Fallback View: Transfers History */}
+        {currentView === 'transfers-history' && (
+          <div className="space-y-4">
+            <div className="flex items-center justify-between pb-2 border-b border-neutral-200 dark:border-neutral-800">
+              <button
+                onClick={() => setCurrentView('home')}
+                className="text-xs font-semibold px-3 py-1.5 rounded-lg border border-neutral-200 dark:border-neutral-700 hover:bg-neutral-100 dark:hover:bg-neutral-800 text-neutral-700 dark:text-neutral-300"
+              >
+                ← Back to Home
+              </button>
+              <h2 className="text-base font-bold text-neutral-900 dark:text-neutral-100">
+                Transfer Management
+              </h2>
+              <button
+                onClick={handleStartSend}
+                className="text-xs font-semibold px-3 py-1.5 rounded-lg bg-cyan-600 hover:bg-cyan-500 text-white shadow-xs"
+              >
+                + Send Files
+              </button>
+            </div>
 
             <TransferList
               transfers={transfers}
@@ -435,7 +460,7 @@ export default function App() {
           <div className="flex items-center gap-2">
             <span>AetherDrop</span>
             <span aria-hidden="true">·</span>
-            <span>Local P2P WebRTC File Transfer</span>
+            <span>SHAREit-Style P2P Local Transfer</span>
             <span aria-hidden="true">·</span>
             <span className="font-mono text-cyan-600 dark:text-cyan-400 font-semibold">PIN: {selfPeer.pin}</span>
           </div>
@@ -445,7 +470,7 @@ export default function App() {
               onClick={() => setIsSecurityModalOpen(true)}
               className="hover:text-neutral-800 dark:hover:text-neutral-200 transition-colors"
             >
-              Security Architecture
+              Zero-Cache Security
             </button>
             <button
               onClick={() => setIsRoomModalOpen(true)}
